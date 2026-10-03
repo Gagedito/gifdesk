@@ -85,7 +85,8 @@ abrirla tras actualizar**, para no usar codigo viejo.
 ### Galeria (libreria)
 
 - Lista `~/.local/share/gifdesk/library/` con dimensiones, cuadros y estado
-  (`[on]` = mostrandose), mas vista previa (GIF; WebP sin vista previa).
+  (`[on]` = mostrandose), mas vista previa animada (GIF y WebP animados se
+  reproducen; los estaticos se muestran fijos).
 - **Anadir**: copia el archivo a la libreria (tu original no se toca; si el
   nombre existe y el contenido difiere, se guarda como `nombre_1.ext`).
 - **Borrar**: pide confirmacion y elimina archivo + su instancia.

@@ -235,6 +235,105 @@ def clamp_xy(x, y):
     return max(0, int(x)), max(0, int(y))
 
 
+def gif_durations(path, maxframes=300):
+    """Duraciones por cuadro (ms) via Pillow. [] si no se puede leer."""
+    try:
+        from PIL import Image
+        im = Image.open(path)
+        durs = []
+        n = min(getattr(im, "n_frames", 1), maxframes)
+        for i in range(max(1, n)):
+            try:
+                im.seek(i)
+            except Exception:
+                break
+            d = im.info.get("duration") or 100
+            durs.append(max(20, min(int(d), 2000)))
+        return durs
+    except Exception:
+        return []
+
+
+def webp_animation(path, maxwh=220, maxframes=200):
+    """(frames PIL RGBA, duraciones ms, animado?) para WebP.
+    Estatico -> ([img], [0], False). Falla -> ([], [], False)."""
+    try:
+        from PIL import Image
+        im = Image.open(path)
+        if not getattr(im, "is_animated", False):
+            one = im.convert("RGBA")
+            one.thumbnail((maxwh, maxwh), Image.LANCZOS)
+            return [one], [0], False
+        frames, durs = [], []
+        for i in range(min(im.n_frames, maxframes)):
+            try:
+                im.seek(i)
+            except Exception:
+                break
+            fr = im.convert("RGBA")
+            fr.thumbnail((maxwh, maxwh), Image.LANCZOS)
+            frames.append(fr)
+            durs.append(max(20, min(int(im.info.get("duration") or 100), 2000)))
+        return frames, durs, bool(frames)
+    except Exception:
+        return [], [], False
+
+
+def preview_cache_key(path):
+    """Clave estable por contenido (renombres no duplican cache)."""
+    import hashlib
+    try:
+        h = hashlib.sha1()
+        with open(path, "rb") as f:
+            for blk in iter(lambda: f.read(1 << 20), b""):
+                h.update(blk)
+        return h.hexdigest()[:16]
+    except OSError:
+        return None
+
+
+def preview_cache_dir():
+    base = Path(os.environ.get("XDG_CACHE_HOME",
+                               os.path.join(str(Path.home()), ".cache")))
+    d = base / "gifdesk" / "preview"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def preview_build(path, maxwh=220):
+    """Extrae PNGs pequenos + duraciones. (pngs, durs, animado?).
+    Correcto por construccion (ffmpeg maneja disposal). Lento: usar en hilo.
+    Si ya esta en cache de disco, es rapido."""
+    try:
+        key = preview_cache_key(path)
+        if not key:
+            return [], [], False
+        outdir = preview_cache_dir() / key
+        durf = outdir / "durations.txt"
+        if outdir.is_dir() and durf.exists():
+            pngs = sorted(outdir.glob("f*.png"))
+            if pngs:
+                durs = [int(x) for x in durf.read_text().split()]
+                return pngs, durs, len(pngs) > 1
+        outdir.mkdir(parents=True, exist_ok=True)
+        r = subprocess.run(
+            ["ffmpeg", "-v", "error", "-y", "-i", str(path), "-vf",
+             f"scale={maxwh}:{maxwh}:force_original_aspect_ratio=decrease",
+             str(outdir / "f%03d.png")],
+            capture_output=True, timeout=120)
+        if r.returncode != 0:
+            return [], [], False
+        pngs = sorted(outdir.glob("f*.png"))
+        if not pngs:
+            return [], [], False
+        durs = gif_durations(str(path)) or [100] * len(pngs)
+        durs = (durs + [100] * len(pngs))[:len(pngs)]
+        durf.write_text(" ".join(str(int(x)) for x in durs))
+        return pngs, durs, len(pngs) > 1
+    except Exception:
+        return [], [], False
+
+
 def unique_dest(name):
     dest = LIB_DIR / name
     if not dest.exists():
@@ -302,7 +401,46 @@ def main():
     tk.Label(left, textvariable=detail_var, anchor="w", justify="left").pack(fill="x")
     preview = tk.Label(left, text="(sin vista previa)")
     preview.pack(pady=4)
-    preview_img = {"img": None}  # ref para que no la libere el GC
+    preview_img = {"img": None}  # refs para que no las libere el GC
+    preview_play = {"job": None, "frames": [], "durs": [], "idx": 0, "key": 0}
+    preview_cache = {}  # ruta -> (photos, durs): revisitar es instantaneo
+
+    def stop_preview():
+        preview_play["key"] += 1
+        if preview_play["job"] is not None:
+            try:
+                root.after_cancel(preview_play["job"])
+            except Exception:
+                pass
+            preview_play["job"] = None
+        preview_play["frames"] = []
+        preview_img["img"] = None
+
+    def play_preview(frames, durs):
+        """Anima frames (PhotoImage) con sus duraciones. Sin frames = nada."""
+        stop_preview()
+        if not frames:
+            preview.config(image="", text="(sin vista previa)")
+            return
+        key = preview_play["key"] + 1
+        preview_play.update(key=key, frames=frames, durs=durs or [100] * len(frames),
+                            idx=0)
+
+        def tick(k):
+            if k != preview_play["key"]:
+                return
+            fr = preview_play["frames"]
+            if not fr:
+                return
+            i = preview_play["idx"] % len(fr)
+            preview_img["img"] = fr[i]
+            preview.config(image=fr[i], text="")
+            preview_play["idx"] = i + 1
+            dd = preview_play["durs"]
+            d = dd[i % len(dd)] if dd else 100
+            preview_play["job"] = root.after(max(20, d), lambda: tick(k))
+
+        tick(key)
 
     def library_files():
         return sorted(
@@ -354,27 +492,65 @@ def main():
 
     def on_select(*_a):
         p = selected_path()
+        stop_preview()
         if p is None:
             detail_var.set("Libreria vacia: usa Anadir")
             preview.config(image="", text="(sin vista previa)")
             load_selection()
             return
         detail_var.set(f"{p.name}\n{file_info(p)}")
-        # Vista previa solo para GIF (tkinter no lee WebP).
-        try:
-            if p.suffix.lower() == ".gif":
-                img = tk.PhotoImage(file=str(p))
-                f = max(img.width() // 200, img.height() // 200, 1)
-                if f > 1:
-                    img = img.subsample(f, f)
-                preview_img["img"] = img
-                preview.config(image=img, text="")
+        key = str(p)
+        if key in preview_cache:
+            photos, durs = preview_cache[key]
+            if len(photos) > 1:
+                play_preview(photos, durs)
+            elif photos:
+                preview_img["img"] = photos[0]
+                preview.config(image=photos[0], text="")
             else:
-                raise tk.TclError("webp sin vista previa")
-        except (tk.TclError, OSError):
-            preview_img["img"] = None
-            preview.config(image="", text="(WebP: sin vista previa)")
+                preview.config(image="", text="(no se pudo leer)")
+            load_selection()
+            return
+        # Primer cuadro al instante (1 sola decodificacion Tk).
+        try:
+            first = tk.PhotoImage(file=key)
+            f = max(first.width() // 220, first.height() // 220, 1)
+            if f > 1:
+                first = first.subsample(f, f)
+            preview_img["img"] = first
+            preview.config(image=first, text="")
+        except Exception:
+            pass
         load_selection()
+
+        # Resto en hilo: ffmpeg extrae PNGs (correcto y sin congelar).
+        def build():
+            try:
+                return preview_build(key)
+            except Exception:
+                return [], [], False
+
+        def built(res):
+            pngs, durs, animated = res
+            if not pngs:
+                return
+            try:
+                photos = [tk.PhotoImage(file=str(x)) for x in pngs]
+            except tk.TclError:
+                return
+            preview_cache[key] = (photos, durs)
+            while len(preview_cache) > 4:
+                preview_cache.pop(next(iter(preview_cache)))
+            sel = selected_path()
+            if sel is None or str(sel) != key:
+                return  # ya mira otro
+            if animated and len(photos) > 1:
+                play_preview(photos, durs)
+            elif photos:
+                preview_img["img"] = photos[0]
+                preview.config(image=photos[0], text="")
+
+        in_thread(lambda r: built(r), build)
 
     def do_add():
         src = filedialog.askopenfilename(
