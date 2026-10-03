@@ -268,5 +268,8 @@ autostart, unidad systemd y cache. Las reglas KWin `[gifdesk-*]` se conservan
 
 ## Licencia
 
-GPL-3.0. Tu GIF/WebP sigue siendo tuyo: al añadirlo se conserva el original y
-la app trabaja con una copia en `~/.local/share/gifdesk/library/`.
+Este proyecto se distribuye bajo **GPL-3.0-or-later** (ver `LICENSE`).
+
+Tus GIF/WebP **siguen siendo tuyos**: al añadirlos a la galeria se conserva el
+original intacto y la app trabaja unicamente con una copia en
+`~/.local/share/gifdesk/library/`. La licencia cubre el codigo, no tu contenido.
