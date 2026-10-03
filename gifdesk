@@ -590,6 +590,12 @@ launch() {
     fi
     mkdir -p "$CACHE_DIR"
     rm -f "$SOCKET"
+    # Rotar log: mpv escribe una linea de estado por cuadro (a 50fps crece
+    # rapidisimo). Conservar solo la cola para no inflar disco ni IO.
+    if [[ -f "$LOGFILE" ]]; then
+        tail -c 262144 "$LOGFILE" >"$LOGFILE.tmp" 2>/dev/null || true
+        mv -f "$LOGFILE.tmp" "$LOGFILE" 2>/dev/null || true
+    fi
     log "inicio: id=${IID:-main} file=$f mode=$mode size=${size:-auto} pos=${pos:-BR} locked=$LOCKED sesion=$(detect_session)"
     # setsid + nohup para sobrevivir al cierre del terminal/autostart.
     setsid nohup mpv "${args[@]}" >>"$LOGFILE" 2>&1 < /dev/null &

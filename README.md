@@ -204,13 +204,17 @@ Dos cosas distintas:
 
 ## Consumo
 
-Medido con 2 GIFs (mpv 0.41, Artix), apagando y encendiendo para el delta real:
+Medido apagando y encendiendo para el delta real (mpv 0.41, Artix).
+El CPU escala con los fps del GIF (decodificacion por software):
 
 | Instancia | CPU | RAM real (PSS) |
 |---|---|---|
-| `rem` 480x476 ~16fps | ~6,6 % de un nucleo | **~47 MB** |
-| `ram` 168x112 | ~7,0 % de un nucleo | **~50 MB** |
-| **Total 2 GIFs** | ~13,6 % de un nucleo | **~94 MB** (disponible −96 MB) |
+| `teto-kasane` 144x144 **50fps** | ~23 % de un nucleo | **~50 MB** |
+| `kasane-teto-teto` 81x199 33fps | ~10 % de un nucleo | **~47 MB** |
+| **Total 2 GIFs** | ~33 % de un nucleo | **~94 MB** (disponible −96 MB) |
+
+Un GIF tipico de ~16fps ronda el 7 % de un nucleo. El log (`gifdesk.log`, una
+linea de estado por cuadro) se rota solo a 256 KB en cada arranque.
 
 El GIF se decodifica por CPU siempre (no hay decodificador GPU para GIF/WebP
 animado en ningun reproductor); el ahorro esta en lo demas (sin audio/OSD, un
