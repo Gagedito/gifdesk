@@ -76,13 +76,36 @@ install_deps() {
     else
         msg "mpv ya instalado."
     fi
-    # kdotool (KDE): lee la geometria real para fijar posicion (opcional).
+    # kdotool (KDE, opcional): lee la geometria real para fijar posicion.
+    # Se ofrece con S/N; con -y/--yes se instala directo sin preguntar.
     if ! command -v kdotool >/dev/null 2>&1; then
-        case "$FAM" in
-            arch) sudo pacman -S --needed --noconfirm kdotool 2>/dev/null \
-                    || msg "Aviso: sin kdotool (AUR/chaotic): sin fijar-posicion automatico" ;;
-            *)    msg "Aviso: instala kdotool si tu distro lo trae (fijar posicion real)" ;;
-        esac
+        want_kdotool="no"
+        if [[ "$YES" == "yes" ]]; then
+            want_kdotool="yes"
+        else
+            printf 'Instalar kdotool? (mejora el fijado de posicion real) [S/n] '
+            read -r ans_kd || true
+            [[ "${ans_kd:-}" =~ ^([nN]|no|NO)$ ]] || want_kdotool="yes"
+        fi
+        if [[ "$want_kdotool" == "yes" ]]; then
+            case "$FAM" in
+                arch) sudo pacman -S --needed --noconfirm kdotool 2>/dev/null \
+                        || msg "Aviso: no se pudo instalar kdotool (prueba desde AUR/chaotic)" ;;
+                debian) sudo apt-get install -y kdotool 2>/dev/null \
+                        || msg "Aviso: kdotool no esta en los repos Debian/Ubuntu (opcional)" ;;
+                fedora) sudo dnf install -y kdotool 2>/dev/null \
+                        || msg "Aviso: kdotool no esta en los repos Fedora (opcional)" ;;
+                suse) sudo zypper install -y kdotool 2>/dev/null \
+                        || msg "Aviso: kdotool no esta en los repos openSUSE (opcional)" ;;
+                void) sudo xbps-install -S kdotool 2>/dev/null \
+                        || msg "Aviso: kdotool no esta en los repos Void (opcional)" ;;
+                *) msg "Aviso: instala kdotool manualmente si tu distro lo trae (opcional)" ;;
+            esac
+        else
+            msg "kdotool omitido (opcional; sin fijar-posicion automatico)."
+        fi
+    else
+        msg "kdotool ya instalado."
     fi
     # tkinter para la interfaz grafica (gifdesk-gui).
     if ! python3 -c "import tkinter" 2>/dev/null; then
