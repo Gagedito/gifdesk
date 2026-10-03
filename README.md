@@ -212,9 +212,6 @@ Medido con 2 GIFs (mpv 0.41, Artix), apagando y encendiendo para el delta real:
 | `ram` 168x112 | ~7,0 % de un nucleo | **~50 MB** |
 | **Total 2 GIFs** | ~13,6 % de un nucleo | **~94 MB** (disponible −96 MB) |
 
-Ojo: el RSS (~115-120 MB por proceso) **engaña** porque cuenta dos veces las
-librerias compartidas; lo real es el PSS y el delta del sistema, que coinciden.
-
 El GIF se decodifica por CPU siempre (no hay decodificador GPU para GIF/WebP
 animado en ningun reproductor); el ahorro esta en lo demas (sin audio/OSD, un
 proceso por GIF, compositing en GPU). La GUI cerrada consume cero. Para bajarlo:
