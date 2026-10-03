@@ -1,0 +1,704 @@
+#!/usr/bin/env bash
+# gifdesk — reproductor flotante de GIF / WebP animado, de bajo consumo.
+# Motor: mpv (libavcodec). Solo GIF y WebP. Soporta transparencias (alfa)
+# sobre compositores X11/Wayland. Sin audio, sin OSD, sin bordes.
+set -euo pipefail
+
+APP="gifdesk"
+VERSION="1.0.0"
+SELF_BIN="$(readlink -f "${BASH_SOURCE[0]}")"
+# Politicas KWin (kwinrulesrc): 1 no afectar, 2 forzar, 3 aplicar al
+# inicio. Se usa APPLY (3, colocar al crear; verificado). El 4 (recordar)
+# NO conserva arrastres en la practica: se volvio al 3.
+APPLY_RULE=3
+REV_KEY="gifdeskrev"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/gifdesk"
+INST_DIR="$CONFIG_DIR/instances"
+INPUT_CONF="$CONFIG_DIR/input.conf"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/gifdesk"
+LOGFILE="$CACHE_DIR/gifdesk.log"
+
+# Instancia: "" = clasica (gifdesk.conf); con --id X usa instances/X.conf
+# y proceso/socket/regla propios. Se resuelve en select_instance().
+IID=""
+CONFIG_FILE="$CONFIG_DIR/gifdesk.conf"
+TITLE="$APP"
+RULE_ID="$APP"
+PIDFILE="$CACHE_DIR/$APP.pid"
+SOCKET="$CACHE_DIR/socket"
+
+select_instance() {
+    if [[ -n "$IID" ]]; then
+        [[ "$IID" =~ ^[A-Za-z0-9_-]{1,32}$ ]] \
+            || die "--id solo admite letras, numeros, - y _ (max 32)"
+        # "main" es la clasica; no se puede usar como --id (colisionaria).
+        [[ "$IID" != "main" ]] || die "--id main reservado (es la instancia clasica)"
+        CONFIG_FILE="$INST_DIR/$IID.conf"
+    else
+        CONFIG_FILE="$CONFIG_DIR/gifdesk.conf"
+    fi
+    TITLE="$APP${IID:+-$IID}"
+    RULE_ID="$TITLE"
+    PIDFILE="$CACHE_DIR/$TITLE.pid"
+    SOCKET="$CACHE_DIR/socket${IID:+-$IID}"
+}
+
+FILE=""
+MODE="widget"     # widget | wallpaper
+SIZE=""           # ej: 480x476
+POS=""            # ej: 100,100 | TR | BR | BL | TL | C
+LOCKED="no"       # yes = posicion bloqueada: la ventana ignora el raton
+CLICK_THROUGH="no"  # override puntual por CLI (--click-through)
+OPACITY="100"       # 0-100: transparencia de la ventana (regla KWin)
+# Marcas de "lo puso el CLI": evitan que la config pise un valor por
+# defecto pasado explicitamente (--mode widget, --opacity 100...).
+CLI_MODE=""
+CLI_OPACITY=""
+
+log() { printf '[%s] %s\n' "$APP" "$*" >>"$LOGFILE" 2>/dev/null || true; }
+
+die() { printf 'gifdesk: error: %s\n' "$*" >&2; exit 1; }
+
+msg() { printf '%s\n' "$*"; }
+
+usage() {
+    cat <<'EOF'
+Uso: gifdesk [OPCIONES]
+
+Muestra un GIF o WebP animado en una ventana flotante sin bordes,
+siempre visible, de bajo consumo (mpv + decodificacion por hardware).
+
+Opciones:
+  --id NOMBRE      Instancia independiente (proceso, config y regla propios).
+                   Sin --id se usa la clasica. Cada GIF lleva su --id
+  --save             Guarda FILE/MODE/SIZE/POS/LOCKED en la config (con --id,
+                   en su instancia) para que sobreviva reinicios/autostart
+  --file RUTA        Archivo .gif / .webp a mostrar
+  --mode MODO        widget (defecto) | wallpaper
+  --size WxH         Tamano de ventana (ej: 480x476). Por defecto: tamano nativo
+  --pos GEOM         Posicion: X,Y | TL | TR | BL | BR | C (defecto: BR).
+                       Mejor esfuerzo: en Wayland el compositor puede ignorarla
+  --click-through    La ventana ignora el raton (clics pasan a traves)
+  --opacity PCT      Transparencia 0-100 (100 = opaco, regla KWin)
+  --autostart        Sin --id: clasica + todas las instancias (autostart real).
+                   Con --id: solo esa instancia segun su config
+  --check            Valida el archivo y el entorno sin abrir ventana
+  --dry-run          Muestra el comando mpv que se ejecutaria
+  --stop             Detiene la instancia en ejecucion
+  --stop-all         Detiene todas las instancias
+  --status           Muestra si hay instancia corriendo
+  --list             Lista instancias y su estado
+  --rule-only        Sincroniza la regla KWin desde la config, sin lanzar
+  -h, --help         Esta ayuda
+  -v, --version      Version
+
+Config (~/.config/gifdesk/gifdesk.conf):
+  FILE=/ruta/a/anim.gif
+  MODE=widget
+  SIZE=480x476
+  POS=BR
+  LOCKED=no        # yes = posicion bloqueada (la ventana ignora el raton)
+
+Ejemplos:
+  gifdesk --file ~/Descargas/rem.gif
+  gifdesk --file anim.webp --size 320x400 --pos TR
+  gifdesk --stop
+EOF
+}
+
+# ---------- utilidades ----------
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
+is_supported() {
+    case "$(lower "${1##*.}")" in
+        gif|webp) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+detect_session() {
+    # Imprime: "<tipo>:<escritorio>"  ej: "wayland:kde"
+    local tipo="${XDG_SESSION_TYPE:-}"
+    local de="${XDG_CURRENT_DESKTOP:-${DESKTOP_SESSION:-unknown}}"
+    if [[ -z "$tipo" ]]; then
+        if [[ -n "${WAYLAND_DISPLAY:-}" || -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]]; then
+            tipo="wayland"
+        else
+            tipo="x11"
+        fi
+    fi
+    printf '%s:%s' "$(lower "$tipo")" "$(lower "$de")"
+}
+
+compositor_ok() {
+    # Heuristica: en Wayland casi siempre hay compositor.
+    # En X11, buscar un compositor conocido corriendo.
+    local sess
+    sess="$(detect_session)"
+    case "$sess" in
+        wayland:*) return 0 ;;
+    esac
+    if pgrep -x picom >/dev/null 2>&1 || pgrep -x compton >/dev/null 2>&1 \
+        || pgrep -x kwin_x11 >/dev/null 2>&1 || pgrep -x xfwm4 >/dev/null 2>&1 \
+        || pgrep -x mutter >/dev/null 2>&1 || pgrep -x compiz >/dev/null 2>&1; then
+        return 0
+    fi
+    return 1
+}
+
+native_size() {
+    # Imprime WxH del archivo usando ffprobe si esta disponible.
+    local f="$1" out=""
+    if have ffprobe; then
+        # El '|| true' evita que pipefail+set -e aborte si ffprobe falla.
+        out="$(ffprobe -v error -select_streams v:0 \
+            -show_entries stream=width,height -of csv=p=0:s=x "$f" 2>/dev/null | head -n1 || true)"
+    fi
+    if [[ "$out" =~ ^[0-9]+x[0-9]+$ ]]; then
+        printf '%s' "$out"
+    else
+        printf '480x480'
+    fi
+}
+
+resolve_pos() {
+    # Convierte POS a geometria estilo X11 para mpv ([WxH][{+-}X{+-}Y]).
+    # En Wayland el compositor suele ignorar el posicionamiento absoluto
+    # (KWin/Hyprland centran o aplican sus propias reglas): best-effort.
+    # "C" devuelve vacio para que el compositor centre la ventana.
+    local p="$1"
+    local up
+    up="$(printf '%s' "$p" | tr '[:lower:]' '[:upper:]')"
+    case "$up" in
+        ""|BR)      printf '%s' "-16-16" ;;
+        BL)         printf '%s' "+16-16" ;;
+        TR)         printf '%s' "-16+16" ;;
+        TL)         printf '%s' "+16+16" ;;
+        C|CENTER)   printf '%s' "" ;;
+        +*|-*|*%*)  printf '%s' "$p" ;;  # pasada tal cual: +X+Y, -X-Y, 50%:50% ...
+        *,*)        # "X,Y" -> "+X+Y"
+            if [[ "$p" =~ ^[0-9]+,[0-9]+$ ]]; then
+                printf '+%s' "${p/,/+}"
+            else
+                printf '%s' "-16-16"
+            fi ;;
+        *)          printf '%s' "-16-16" ;;
+    esac
+}
+
+# ---------- backend de colocacion (KDE Wayland via regla KWin) ----------
+# En Wayland el cliente no puede autoposicionarse: KWin ignora --geometry.
+# La solucion es una regla de ventana [gifdesk] (posicion+tamano "al crear"),
+# que se sincroniza sola en cada arranque. En X11 basta con --geometry.
+
+is_kde_wayland() {
+    [[ "${XDG_SESSION_TYPE:-}" == "wayland" ]] || return 1
+    local de="${XDG_CURRENT_DESKTOP:-} ${DESKTOP_SESSION:-}"
+    de="$(printf '%s' "$de" | tr '[:upper:]' '[:lower:]')"
+    [[ "$de" == *kde* || "$de" == *plasma* ]]
+}
+
+kwin_screen() {
+    # "1366x768" de la salida de supportInformation. Vacio si falla.
+    have qdbus6 || return 1
+    timeout 8 qdbus6 org.kde.KWin /KWin org.kde.KWin.supportInformation 2>/dev/null \
+        | sed -n 's/^[[:space:]]*Geometry: 0,0,\([0-9][0-9]*x[0-9][0-9]*\).*/\1/p' \
+        | head -n1
+}
+
+kwin_abspos() {
+    # $1=pos $2=gif_w $3=gif_h $4=scr_w $5=scr_h -> "X,Y" (margen 16).
+    local pos="$1" gw="$2" gh="$3" sw="$4" sh="$5" m=16
+    case "$(printf '%s' "$pos" | tr '[:lower:]' '[:upper:]')" in
+        ""|BR) printf '%d,%d' "$((sw-gw-m))" "$((sh-gh-m))" ;;
+        BL)    printf '%d,%d' "$m" "$((sh-gh-m))" ;;
+        TR)    printf '%d,%d' "$((sw-gw-m))" "$m" ;;
+        TL)    printf '%d,%d' "$m" "$m" ;;
+        C)     printf '%d,%d' "$(((sw-gw)/2))" "$(((sh-gh)/2))" ;;
+        *,*)   printf '%s' "$pos" ;;
+        *)     printf '%d,%d' "$((sw-gw-m))" "$((sh-gh-m))" ;;
+    esac
+}
+
+ensure_kwin_rule() {
+    # $1=X $2=Y $3=W $4=H $5=REV $6=OPACIDAD(0-100). Escribe la regla solo
+    # ante un cambio EXPLICITO (REV distinto al guardado): asi no pisa lo
+    # que KWin haya recordado de tus arrastres. Primera vez: escribe siempre.
+    # La opacidad se fuerza (aplica en vivo sin relanzar).
+    local x="$1" y="$2" w="$3" h="$4" rev="$5" op="$6"
+    have kwriteconfig6 || return 0
+    have qdbus6 || return 0
+    local stored rpos rsize rop rpr rsr
+    stored="$(kreadconfig6 --file kwinrulesrc --group "$RULE_ID" --key "$REV_KEY" 2>/dev/null || true)"
+    rpos="$(kreadconfig6 --file kwinrulesrc --group "$RULE_ID" --key position 2>/dev/null || true)"
+    rsize="$(kreadconfig6 --file kwinrulesrc --group "$RULE_ID" --key size 2>/dev/null || true)"
+    rop="$(kreadconfig6 --file kwinrulesrc --group "$RULE_ID" --key opacityactive 2>/dev/null || true)"
+    rpr="$(kreadconfig6 --file kwinrulesrc --group "$RULE_ID" --key positionrule 2>/dev/null || true)"
+    rsr="$(kreadconfig6 --file kwinrulesrc --group "$RULE_ID" --key sizerule 2>/dev/null || true)"
+    if [[ -n "$stored" && "$stored" == "$rev" && "$rpos" == "$x,$y" \
+        && "$rsize" == "$w,$h" && "$rop" == "$op" \
+        && "$rpr" == "$APPLY_RULE" && "$rsr" == "$APPLY_RULE" ]]; then
+        return 0
+    fi
+        # Titulo anclado regex: evita que "gifdesk" empareje "gifdesk-ram".
+        kwriteconfig6 --file kwinrulesrc --group "$RULE_ID" --key Description "$TITLE"
+        kwriteconfig6 --file kwinrulesrc --group "$RULE_ID" --key title "^${TITLE}$"
+        kwriteconfig6 --file kwinrulesrc --group "$RULE_ID" --key titlematch 3
+        kwriteconfig6 --file kwinrulesrc --group "$RULE_ID" --key position "$x,$y"
+        kwriteconfig6 --file kwinrulesrc --group "$RULE_ID" --key positionrule "$APPLY_RULE"
+        kwriteconfig6 --file kwinrulesrc --group "$RULE_ID" --key size "$w,$h"
+        kwriteconfig6 --file kwinrulesrc --group "$RULE_ID" --key sizerule "$APPLY_RULE"
+        kwriteconfig6 --file kwinrulesrc --group "$RULE_ID" --key "$REV_KEY" "$rev"
+        kwriteconfig6 --file kwinrulesrc --group "$RULE_ID" --key opacityactive "$op"
+        kwriteconfig6 --file kwinrulesrc --group "$RULE_ID" --key opacityactiverule 2
+        kwriteconfig6 --file kwinrulesrc --group "$RULE_ID" --key opacityinactive "$op"
+        kwriteconfig6 --file kwinrulesrc --group "$RULE_ID" --key opacityinactiverule 2
+        local rules
+        rules="$(kreadconfig6 --file kwinrulesrc --group General --key rules 2>/dev/null || true)"
+        case ",$rules," in
+            *",$RULE_ID,"*) ;;
+            *) kwriteconfig6 --file kwinrulesrc --group General --key rules "${rules:+$rules,}$RULE_ID"
+               kwriteconfig6 --file kwinrulesrc --group General --key count \
+                   "$(tr ',' '\n' <<<"${rules:+$rules,}$RULE_ID" | grep -c .)" ;;
+        esac
+        qdbus6 org.kde.KWin /KWin org.kde.KWin.reconfigure 2>/dev/null || true
+        log "regla kwin sincronizada rev=$rev: $x,$y ${w}x$h"
+}
+
+conf_rev() {
+    # REV guardado en una conf (0 si falta/invalido). No falla nunca.
+    local r
+    r="$(grep -E '^[[:space:]]*REV=' "$1" 2>/dev/null | head -n1 \
+        | sed -e 's/^[[:space:]]*REV=//' -e 's/[^0-9]//g' || true)"
+    [[ "$r" =~ ^[0-9]+$ ]] && printf '%s' "$r" || printf '0'
+}
+
+bump_rev() {
+    # Siguiente REV para un cambio explicito del editor/CLI. Imprime el nuevo.
+    local cur next
+    cur="$(conf_rev "$1")"
+    next=$((cur + 1))
+    if grep -qE '^[[:space:]]*REV=' "$1" 2>/dev/null; then
+        sed -i "s/^[[:space:]]*REV=.*/REV=$next/" "$1"
+    else
+        echo "REV=$next" >>"$1"
+    fi
+    printf '%s' "$next"
+}
+
+sync_placement() {
+    # $1=pos $2=size(WxH) $3=opacidad. En KDE Wayland escribe la regla
+    # (solo si la REV cambio = orden explicita); resto: nada.
+    is_kde_wayland || return 0
+    local scr gw gh op
+    scr="$(kwin_screen)" || return 0
+    [[ -n "$scr" ]] || return 0
+    gw="${2%x*}"; gh="${2#*x}"
+    [[ "$gw" =~ ^[0-9]+$ && "$gh" =~ ^[0-9]+$ ]] || return 0
+    op="$3"; [[ "$op" =~ ^[0-9]+$ ]] || op=100
+    (( op < 0 )) && op=0; (( op > 100 )) && op=100
+    local xy rev
+    xy="$(kwin_abspos "$1" "$gw" "$gh" "${scr%x*}" "${scr#*x}")"
+    rev="$(conf_rev "$CONFIG_FILE")"
+    ensure_kwin_rule "${xy%,*}" "${xy#*,}" "$gw" "$gh" "$rev" "$op"
+}
+
+running_pid() {    if [[ -f "$PIDFILE" ]]; then
+        local pid
+        pid="$(cat "$PIDFILE" 2>/dev/null || true)"
+        if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+            printf '%s' "$pid"
+            return 0
+        fi
+    fi
+    # Respaldo: buscar mpv con nuestro titulo (unico por instancia).
+    # Anclado al final o espacio para no confundir gifdesk con gifdesk-otro.
+    local alt
+    alt="$(pgrep -f -- "--title=${TITLE}( |$)" 2>/dev/null | head -n1 || true)"
+    if [[ -n "$alt" ]]; then
+        printf '%s' "$alt"
+        return 0
+    fi
+    return 1
+}
+
+file_of() {
+    # Valor de FILE= en una conf (sin comillas). Vacio si no hay.
+    # Nunca falla (pipefail no debe abortar a quien la llama).
+    grep -E '^[[:space:]]*FILE=' "$1" 2>/dev/null | head -n1 \
+        | sed -e 's/^[[:space:]]*FILE=//' -e 's/^"//' -e 's/"[[:space:]]*$//' || true
+}
+
+has_file() {
+    [[ -n "$(file_of "$1")" ]]
+}
+
+known_ids() {
+    # Imprime un id por linea: main (si la clasica tiene FILE) + instances/.
+    if has_file "$CONFIG_DIR/gifdesk.conf"; then
+        printf 'main\n'
+    fi
+    mkdir -p "$INST_DIR" 2>/dev/null || true
+    local f id
+    for f in "$INST_DIR"/*.conf; do
+        [[ -e "$f" ]] || continue
+        id="$(basename "$f" .conf)"
+        [[ "$id" =~ ^[A-Za-z0-9_-]{1,32}$ ]] || continue
+        printf '%s\n' "$id"
+    done
+}
+
+list_instances() {
+    local i ff st any=no
+    while IFS= read -r i; do
+        any=yes
+        if [[ "$i" == "main" ]]; then
+            ff="$(file_of "$CONFIG_DIR/gifdesk.conf")"
+            if "$SELF_BIN" --status >/dev/null 2>&1; then st="corriendo"; else st="detenida"; fi
+        else
+            ff="$(file_of "$INST_DIR/$i.conf")"
+            if "$SELF_BIN" --id "$i" --status >/dev/null 2>&1; then st="corriendo"; else st="detenida"; fi
+        fi
+        printf '%-16s %-10s %s\n' "$i" "$st" "${ff:-"(sin archivo)"}"
+    done < <(known_ids)
+    [[ "$any" == "yes" ]] || msg "sin instancias (usa la GUI o --id NOMBRE --file ... --save)"
+}
+
+run_autostart() {
+    # Lanza ESTA instancia (IID ya resuelto) segun su config. Solo config.
+    MODE="widget"; FILE=""; SIZE=""; POS=""; LOCKED="no"; OPACITY="100"
+    load_config
+    [[ -z "$FILE" ]] && die "autostart sin FILE ($CONFIG_FILE)"
+    [[ "$MODE" =~ ^(widget|wallpaper)$ ]] || die "MODE invalido en $CONFIG_FILE"
+    launch "$FILE" "$MODE" "$SIZE" "$POS" "no"
+}
+
+autostart_all() {
+    # Sin --id: clasica (si tiene FILE) + todas las de instances/.
+    local n=0 i
+    while IFS= read -r i; do
+        if [[ "$i" == "main" ]]; then
+            "$SELF_BIN" --autostart-legacy >/dev/null 2>&1 && n=$((n+1)) || true
+        else
+            "$SELF_BIN" --id "$i" --autostart >/dev/null 2>&1 && n=$((n+1)) || true
+        fi
+    done < <(known_ids)
+    [[ $n -gt 0 ]] || die "nada que mostrar (sin FILE en configs)"
+    msg "instancias lanzadas: $n"
+}
+
+cmd_stop() {
+    local pid
+    if pid="$(running_pid)"; then
+        kill "$pid" 2>/dev/null || true
+        sleep 0.5
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -9 "$pid" 2>/dev/null || true
+        fi
+        rm -f "$PIDFILE" "$SOCKET"
+        msg "gifdesk detenido (pid $pid)."
+    else
+        rm -f "$PIDFILE" "$SOCKET"
+        msg "gifdesk no estaba en ejecucion."
+    fi
+}
+
+cmd_stop_all() {
+    # Detiene la clasica + todas las instancias.
+    local i
+    while IFS= read -r i; do
+        if [[ "$i" == "main" ]]; then
+            IID="" select_instance
+        else
+            IID="$i" select_instance
+        fi
+        cmd_stop >/dev/null 2>&1 || true
+    done < <(known_ids)
+    msg "todas las instancias detenidas"
+}
+
+cmd_status() {
+    local pid
+    if pid="$(running_pid)"; then
+        msg "gifdesk en ejecucion (pid $pid)."
+    else
+        msg "gifdesk detenido."
+        return 1
+    fi
+}
+
+cmd_check() {
+    local f="$1" rc=0
+    if [[ -z "$f" ]]; then
+        printf 'check: falta --file (o FILE en gifdesk.conf)\n' >&2; rc=1
+    elif [[ ! -f "$f" ]]; then
+        printf 'check: no existe: %s\n' "$f" >&2; rc=1
+    elif ! is_supported "$f"; then
+        printf 'check: extension no soportada (solo .gif / .webp): %s\n' "$f" >&2; rc=1
+    else
+        printf 'check: archivo OK: %s\n' "$f"
+        if have ffprobe; then
+            ffprobe -v error -select_streams v:0 \
+                -show_entries stream=codec_name,width,height,pix_fmt,avg_frame_rate,nb_frames \
+                -of default=noprint_wrappers=1 "$f" 2>&1 || rc=1
+        fi
+    fi
+    if have mpv; then
+        printf 'check: mpv OK: %s\n' "$(mpv --version 2>/dev/null | head -n1)"
+    else
+        printf 'check: falta mpv en el PATH\n' >&2; rc=1
+    fi
+    printf 'check: sesion: %s\n' "$(detect_session)"
+    if compositor_ok; then
+        printf 'check: compositor: detectado (transparencia disponible)\n'
+    else
+        printf 'check: compositor: NO detectado (la transparencia puede verse negra)\n' >&2
+    fi
+    return "$rc"
+}
+
+build_mpv_args() {
+    # $1=file $2=mode $3=size $4=pos ; imprime args separados por NUL.
+    local f="$1" mode="$2" size="$3" pos="$4"
+    local geo autofit
+    if [[ -z "$size" ]]; then
+        size="$(native_size "$f")"
+    fi
+    autofit="$size"
+    geo="$(resolve_pos "$pos")"
+
+    # Base de bajo consumo: sin audio, sin OSD, loop infinito,
+    # decodificacion por hardware cuando exista, respeto al timing
+    # original del GIF/WebP (sin --untimed, que dispararia la CPU).
+    local -a a=(
+        --no-audio
+        --osd-level=0
+        --osc=no
+        --no-input-default-bindings
+        --input-vo-keyboard=no
+        --cursor-autohide=no
+        --keep-open=yes
+        --loop-file=inf
+        --untimed=no
+        --framedrop=no
+        --window-scale=1
+        --vo=gpu-next,gpu,dmabuf-wayland,wlshm,x11
+        --hwdec=auto-safe
+        --title="$TITLE"
+        --wayland-app-id="$TITLE"
+        --input-ipc-server="$SOCKET"
+    )
+    # Atajos extra sobre el GIF si el usuario los define en input.conf.
+    if [[ -f "$INPUT_CONF" ]]; then
+        a+=(--input-conf="$INPUT_CONF")
+    fi
+
+    if [[ "$mode" == "wallpaper" ]]; then
+        # Fondo de pantalla falso: pantalla completa detras de todo.
+        a+=(
+            --fullscreen=yes
+            --ontop=no
+            --on-all-workspaces=yes
+            --show-in-taskbar=no
+            --border=no
+            --keepaspect-window=no
+            --background-color=#FF000000
+        )
+    else
+        # Widget flotante: solo el gif, con alfa real (#00000000).
+        # En KDE Wayland la posicion/tamano se imponen via regla KWin
+        # (el compositor ignora --geometry); en X11 vale --geometry.
+        # La opacidad tambien va por regla (mpv no tiene --opacity).
+        sync_placement "$pos" "$size" "$OPACITY"
+        a+=(
+            --border=no
+            --ontop=yes
+            --on-all-workspaces=yes
+            --show-in-taskbar=no
+            --keepaspect-window=yes
+            --autofit="$autofit"
+            --background-color=#00000000
+        )
+        # Sin geometria ("C") el compositor centra la ventana.
+        if [[ -n "$geo" ]]; then
+            a+=(--geometry="$geo")
+        fi
+    fi
+
+    if [[ "$CLICK_THROUGH" == "yes" || "$LOCKED" == "yes" ]]; then
+        a+=(--input-cursor-passthrough=yes --input-cursor=no)
+    fi
+
+    a+=(-- "$f")
+    printf '%s\0' "${a[@]}"
+}
+
+launch() {
+    local f="$1" mode="$2" size="$3" pos="$4" dry="$5"
+    local -a args=()
+    while IFS= read -r -d '' tok; do
+        args+=("$tok")
+    done < <(build_mpv_args "$f" "$mode" "$size" "$pos")
+
+    if [[ "$dry" == "yes" ]]; then
+        printf 'mpv'
+        printf ' %q' "${args[@]}"
+        printf '\n'
+        return 0
+    fi
+
+    if ! compositor_ok; then
+        printf 'gifdesk: aviso: no se detecto compositor; la transparencia puede verse negra.\n' >&2
+        log "aviso: sin compositor, alfa degradado"
+    fi
+
+    # Instancia unica: si ya corre, se reemplaza.
+    if running_pid >/dev/null 2>&1; then
+        cmd_stop >/dev/null 2>&1 || true
+    fi
+    mkdir -p "$CACHE_DIR"
+    rm -f "$SOCKET"
+    log "inicio: id=${IID:-main} file=$f mode=$mode size=${size:-auto} pos=${pos:-BR} locked=$LOCKED sesion=$(detect_session)"
+    # setsid + nohup para sobrevivir al cierre del terminal/autostart.
+    setsid nohup mpv "${args[@]}" >>"$LOGFILE" 2>&1 < /dev/null &
+    local pid=$!
+    printf '%s' "$pid" >"$PIDFILE"
+    # Darle un momento y comprobar que no murio al instante.
+    sleep 0.6
+    if kill -0 "$pid" 2>/dev/null; then
+        msg "gifdesk mostrando: $f (pid $pid)"
+    else
+        rm -f "$PIDFILE"
+        die "mpv termino de inmediato; revisa $LOGFILE"
+    fi
+}
+
+load_config() {
+    if [[ -f "$CONFIG_FILE" ]]; then
+        # Solo claves conocidas, para no ejecutar nada arbitrario.
+        local k v
+        while IFS='=' read -r k v; do
+            k="$(printf '%s' "$k" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+            v="$(printf '%s' "$v" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//')"
+            [[ "$k" =~ ^#.*$ || -z "$k" ]] && continue
+            # Ramas con 'if' (no '&&'): un test falso como ultima orden del
+            # cuerpo dejaria al bucle con estado 1 y 'set -e' abortaria.
+            case "$k" in
+                FILE) if [[ -z "$FILE" ]]; then FILE="$v"; fi ;;
+                MODE) if [[ -z "${CLI_MODE:-}" && "$MODE" == "widget" && "$v" =~ ^(widget|wallpaper)$ ]]; then MODE="$v"; fi ;;
+                SIZE) if [[ -z "$SIZE" ]]; then SIZE="$v"; fi ;;
+                POS)  if [[ -z "$POS" ]]; then POS="$v"; fi ;;
+                LOCKED) if [[ "$LOCKED" == "no" && "$v" =~ ^(yes|no)$ ]]; then LOCKED="$v"; fi ;;
+                OPACITY) if [[ -z "${CLI_OPACITY:-}" && "$OPACITY" == "100" && "$v" =~ ^[0-9]+$ ]]; then
+                    OPACITY="$v"; (( OPACITY < 0 )) && OPACITY=0
+                    (( OPACITY > 100 )) && OPACITY=100
+                fi ;;
+            esac
+        done <"$CONFIG_FILE"
+    fi
+    return 0
+}
+
+main() {
+    local dry="no" do_check="no" autostart="no" action="" save="no"
+    mkdir -p "$CACHE_DIR" "$INST_DIR" 2>/dev/null || true
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --id)        [[ $# -ge 2 ]] || die "--id necesita un nombre"; IID="$2"; shift 2 ;;
+            --id=*)      IID="${1#*=}"; shift ;;
+            --file)      [[ $# -ge 2 ]] || die "--file necesita un valor"; FILE="$2"; shift 2 ;;
+            --file=*)    FILE="${1#*=}"; shift ;;
+            --mode)      [[ $# -ge 2 ]] || die "--mode necesita un valor"; MODE="$2"; CLI_MODE=1; shift 2 ;;
+            --mode=*)    MODE="${1#*=}"; CLI_MODE=1; shift ;;
+            --size)      [[ $# -ge 2 ]] || die "--size necesita un valor"; SIZE="$2"; shift 2 ;;
+            --size=*)    SIZE="${1#*=}"; shift ;;
+            --pos)       [[ $# -ge 2 ]] || die "--pos necesita un valor"; POS="$2"; shift 2 ;;
+            --pos=*)     POS="${1#*=}"; shift ;;
+            --click-through) CLICK_THROUGH="yes"; shift ;;
+            --opacity)
+                [[ $# -ge 2 ]] || die "--opacity necesita un valor 0-100"
+                OPACITY="$2"; CLI_OPACITY=1; shift 2
+                [[ "$OPACITY" =~ ^[0-9]+$ ]] || die "--opacity 0-100"
+                (( OPACITY < 0 )) && OPACITY=0
+                (( OPACITY > 100 )) && OPACITY=100 ;;
+            --save)      save="yes"; shift ;;
+            --autostart) autostart="yes"; shift ;;
+            --autostart-legacy) autostart="legacy"; shift ;;
+            --check)     do_check="yes"; shift ;;
+            --dry-run)   dry="yes"; shift ;;
+            --stop)      action="stop"; shift ;;
+            --stop-all)  action="stopall"; shift ;;
+            --status)    action="status"; shift ;;
+            --list)      action="list"; shift ;;
+            --rule-only) action="ruleonly"; shift ;;
+            -h|--help)   usage; exit 0 ;;
+            -v|--version) printf 'gifdesk %s\n' "$VERSION"; exit 0 ;;
+            --) shift; break ;;
+            -*) die "opcion desconocida: $1 (usa --help)" ;;
+            *)  if [[ -z "$FILE" ]]; then FILE="$1"; shift
+                else die "archivo duplicado: $1"; fi ;;
+        esac
+    done
+
+    select_instance
+
+    case "$action" in
+        stop)    cmd_stop; exit 0 ;;
+        status)  cmd_status; exit $? ;;
+        list)    list_instances; exit 0 ;;
+        stopall) cmd_stop_all; exit 0 ;;
+        ruleonly)
+            MODE="widget"; FILE=""; SIZE=""; POS=""; LOCKED="no"; OPACITY="100"
+            load_config
+            [[ -z "$FILE" || ! -f "$FILE" ]] && die "sin archivo para regla"
+            [[ -z "$SIZE" ]] && SIZE="$(native_size "$FILE")"
+            sync_placement "$POS" "$SIZE" "$OPACITY"
+            msg "regla sincronizada (id=${IID:-main})"
+            exit 0 ;;
+    esac
+
+    if [[ "$autostart" == "yes" ]]; then
+        if [[ -z "$IID" ]]; then
+            autostart_all; exit $?
+        fi
+        run_autostart; exit $?
+    elif [[ "$autostart" == "legacy" ]]; then
+        run_autostart; exit $?
+    else
+        load_config
+    fi
+
+    [[ "$MODE" =~ ^(widget|wallpaper)$ ]] || die "--mode debe ser widget|wallpaper"
+    [[ -z "$FILE" ]] && { usage >&2; die "falta --file (ej: gifdesk --file ~/Descargas/rem.gif)"; }
+    [[ -f "$FILE" ]] || die "no existe: $FILE"
+    is_supported "$FILE" || die "solo .gif / .webp: $FILE"
+    have mpv || die "falta mpv (instala con install.sh)"
+
+    if [[ "$save" == "yes" ]]; then
+        mkdir -p "$(dirname "$CONFIG_FILE")"
+        # Ojo: reescribir pierde REV; se calcula antes para no romper la
+        # cadena de revisiones (la regla solo se reescribe si REV cambia).
+        local next_rev
+        next_rev=$(( $(conf_rev "$CONFIG_FILE") + 1 ))
+        {
+            printf '# gifdesk — instancia %s (la usa --autostart)\n' "${IID:-main}"
+            printf 'FILE="%s"\n' "$FILE"
+            printf 'MODE=%s\nSIZE=%s\nPOS=%s\nLOCKED=%s\nREV=%s\nOPACITY=%s\n' \
+                "$MODE" "$SIZE" "$POS" "$LOCKED" "$next_rev" "$OPACITY"
+        } >"$CONFIG_FILE"
+        msg "config guardada: $CONFIG_FILE (rev $next_rev)"
+    fi
+
+    if [[ "$do_check" == "yes" ]]; then
+        cmd_check "$FILE"
+        exit $?
+    fi
+
+    launch "$FILE" "$MODE" "$SIZE" "$POS" "$dry"
+}
+
+main "$@"

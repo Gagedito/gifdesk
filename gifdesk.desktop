@@ -1,0 +1,13 @@
+# Plantilla de referencia. install.sh genera el .desktop real con la ruta
+# absoluta en Exec (aqui se usa el nombre, que resuelve por PATH cuando
+# ~/.local/bin esta en el PATH).
+[Desktop Entry]
+Type=Application
+Name=gifdesk
+Comment=Muestra un GIF/WebP flotante al iniciar sesion
+Exec=gifdesk --autostart
+Icon=image-x-generic
+Terminal=false
+Categories=Utility;
+X-GNOME-Autostart-enabled=true
+X-GNOME-Autostart-Delay=2

@@ -1,0 +1,14 @@
+[Unit]
+Description=gifdesk — GIF/WebP flotante al iniciar sesion
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=forking
+PIDFile=%h/.cache/gifdesk/gifdesk.pid
+ExecStart=%h/.local/bin/gifdesk --autostart
+ExecStop=%h/.local/bin/gifdesk --stop
+Restart=no
+
+[Install]
+WantedBy=graphical-session.target

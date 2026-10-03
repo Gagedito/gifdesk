@@ -1,0 +1,10 @@
+# Plantilla de referencia para el menu de aplicaciones.
+# install.sh genera el .desktop real con la ruta absoluta en Exec.
+[Desktop Entry]
+Type=Application
+Name=gifdesk gestor
+Comment=Gestiona tus GIF/WebP flotantes (galeria y editor)
+Exec=gifdesk-gui
+Icon=image-x-generic
+Terminal=false
+Categories=Utility;Graphics;
