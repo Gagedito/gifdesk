@@ -105,10 +105,11 @@ Todo lo que cambies aqui afecta **solo al GIF seleccionado** (mira
 - **Aplicar cambios**: guarda y relanza esa instancia con lo nuevo. Si no
   cambiaste nada, no hace nada (para no devolverlo a su sitio en vano). Se
   bloquea mientras trabaja para evitar dobles pulsaciones.
-- **Bloquear/Desbloquear posicion**: congela la ventana **donde esta** (ignora
-  el raton) o la libera, **en vivo y sin relanzar**. Nombra la instancia
-  (`Bloqueado rem donde esta`). Si el seleccionado no se muestra, avisa cual
-  si lo esta (mira `[on]`).
+- **Bloquear/Desbloquear posicion**: lee donde esta (kdotool), lo guarda y
+  relanza ahi mismo: fija la ventana (ignora el raton) o la libera,
+  conservando el sitio. Nombra la instancia (`Bloqueado rem donde esta`).
+  Si el seleccionado no se muestra, avisa cual si lo esta (mira `[on]`).
+- **Fijar posicion actual**: guarda donde esta sin relanzar.
 - **Iniciar/Detener**: muestra o quita el seleccionado.
 
 > Regla de oro: **desbloqueado = editable** (mover, rueda si la configuras,

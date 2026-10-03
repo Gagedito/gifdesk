@@ -357,12 +357,25 @@ def main():
     cfg = blank_cfg()
     cur = {"id": None}  # instancia seleccionada (una por GIF, independientes)
 
+    # Errores de callbacks Tk a fichero (al abrir por menu, stderr se pierde).
+    def _log_err(exc, val, tb):
+        try:
+            import traceback
+            logp = Path(os.environ.get("XDG_CACHE_HOME",
+                                       os.path.join(str(Path.home()), ".cache")))
+            logp = logp / "gifdesk" / "gui.log"
+            with open(logp, "a") as f:
+                f.write(traceback.format_exception(exc, val, tb))
+        except Exception:
+            pass
+
     def cur_id():
         return cur["id"]
 
     root = tk.Tk()
     root.title("gifdesk — gestor")
-    root.geometry("680x500")
+    root.geometry("880x640")
+    root.minsize(720, 520)
 
     status_var = tk.StringVar(value="")
 
@@ -449,6 +462,10 @@ def main():
             key=lambda p: p.name.lower())
 
     def refresh_list(select=None):
+        # Sin seleccion explicita, conservar la actual (no saltar al 1).
+        if select is None:
+            p0 = selected_path()
+            select = p0.name if p0 else None
         lib_list.delete(0, tk.END)
         files = library_files()
         sel_idx = None
@@ -634,9 +651,31 @@ def main():
     lib_list.bind("<<ListboxSelect>>", on_select)
     lib_list.bind("<Double-Button-1>", lambda _e: do_show())
 
-    # ---------- editor ----------
-    right = tk.LabelFrame(root, text="Modo editor", padx=6, pady=6)
-    right.pack(side="right", fill="both", expand=True, padx=6, pady=6)
+    # ---------- editor (con scroll: entra a cualquier tamano) ----------
+    right_outer = tk.LabelFrame(root, text="Modo editor", padx=6, pady=6)
+    right_outer.pack(side="right", fill="both", expand=True, padx=6, pady=6)
+    right_canvas = tk.Canvas(right_outer, highlightthickness=0)
+    right_scroll = tk.Scrollbar(right_outer, orient="vertical",
+                                command=right_canvas.yview)
+    right_canvas.configure(yscrollcommand=right_scroll.set)
+    right_scroll.pack(side="right", fill="y")
+    right_canvas.pack(side="left", fill="both", expand=True)
+    right = tk.Frame(right_canvas)
+    right_win = right_canvas.create_window((0, 0), window=right, anchor="nw")
+
+    def _right_scroll_cfg(_ev=None):
+        right_canvas.configure(scrollregion=right_canvas.bbox("all"))
+        right_canvas.itemconfig(right_win, width=right_canvas.winfo_width())
+
+    right.bind("<Configure>", lambda _e: right_canvas.after_idle(_right_scroll_cfg))
+    right_canvas.bind("<Configure>", lambda _e: right_canvas.after_idle(_right_scroll_cfg))
+    # Rueda sobre el editor hace scroll (sin robar la de posicion).
+    right_canvas.bind_all("<Button-4>",
+                         lambda e: right_canvas.yview_scroll(-1, "units")
+                         if str(e.widget).startswith(str(right_outer)) else None)
+    right_canvas.bind_all("<Button-5>",
+                         lambda e: right_canvas.yview_scroll(1, "units")
+                         if str(e.widget).startswith(str(right_outer)) else None)
 
     cur_var = tk.StringVar(value="")
     tk.Label(right, text="Archivo actual:").pack(anchor="w")
@@ -845,6 +884,48 @@ def main():
                     ids.append(parts[0])
         return ids
 
+    def apply_live_geometry(iid):
+        """Lee X Y W H reales (kdotool) y los guarda en la config + bump.
+        Devuelve (x, y, w, h) o None si no se ve."""
+        rc, out = run_inst(iid, "--where")
+        if rc != 0:
+            return None
+        parts = out.split()
+        if len(parts) != 5:
+            return None
+        _title, x, y, w, h = parts
+        if not (x.lstrip("-").isdigit() and y.lstrip("-").isdigit()
+                and w.isdigit() and h.isdigit()):
+            return None
+        x, y = max(0, int(x)), max(0, int(y))
+        w, h = max(48, int(w)), max(48, int(h))
+        cfg["POS"] = f"{x},{y}"
+        cfg["SIZE"] = f"{w}x{h}"
+        write_config(cfg, inst_conf(iid))
+        bump_rev(inst_conf(iid))
+        return x, y, w, h
+
+    def do_fix_position():
+        """Fija la posicion/tamano ACTUALES (donde lo arrastraste)."""
+        iid = cur_id()
+        if iid is None:
+            messagebox.showinfo("gifdesk", "Selecciona un GIF de la galeria")
+            return
+        if not is_running_inst(iid):
+            messagebox.showinfo("gifdesk", "Ese GIF no se esta mostrando")
+            return
+        got = apply_live_geometry(iid)
+        if got is None:
+            messagebox.showinfo(
+                "gifdesk",
+                "No veo la ventana (falta kdotool o no esta visible).\n"
+                "Instala: sudo pacman -S kdotool")
+            return
+        x, y, w, h = got
+        sync_editor_from_config()
+        refresh_status_line()
+        set_status(f"Fijado donde esta: {w}x{h} @ {x},{y}")
+
     def do_lock_toggle():
         iid = cur_id()
         if iid is None:
@@ -863,23 +944,27 @@ def main():
             refresh_status_line()
             return
         new_lock = "no" if cfg.get("LOCKED") == "yes" else "yes"
-        cfg["LOCKED"] = new_lock
-        adopt_legacy(cfg.get("FILE", ""))
-        write_config(cfg, inst_conf(iid))
-        refresh_lock()
-        refresh_status_line()
         lock = (new_lock == "yes")
         set_status(f"{'Bloqueando' if lock else 'Desbloqueando'} {iid}...")
 
         def work():
-            return live_lock(iid, lock)
+            # Hilo: capturar sitio + guardar + IPC en vivo (nada bloquea la GUI).
+            live = apply_live_geometry(iid)
+            cfg["LOCKED"] = new_lock
+            adopt_legacy(cfg.get("FILE", ""))
+            write_config(cfg, inst_conf(iid))
+            if live is None:
+                bump_rev(inst_conf(iid))
+            if live_lock(iid, lock):
+                return ("live", None)
+            return ("relaunch", None)
 
         def done(res):
-            if res:
+            kind, _out = res
+            if kind == "live":
                 verb = "Bloqueado" if lock else "Desbloqueado"
-                set_status(f"{verb} {iid} donde esta (sin moverlo)")
+                set_status(f"{verb} {iid} donde esta (en vivo)")
             else:
-                # Sin IPC: relanzar (vuelve a su sitio configurado).
                 set_status("Sin respuesta en vivo, relanzando...")
 
                 def done2(res2):
@@ -891,16 +976,20 @@ def main():
                         set_status(f"{verb} {iid} en su sitio ({cfg['POS'] or 'BR'})")
                     refresh_lock()
                     refresh_status_line()
+                    sync_editor_from_config()
 
                 in_thread(done2, run_inst, iid, "--autostart")
                 return
             refresh_lock()
             refresh_status_line()
+            sync_editor_from_config()
 
         in_thread(done, work)
 
     lock_btn.config(command=do_lock_toggle)
     lock_btn.pack(anchor="w")
+    tk.Button(right, text="Fijar posicion actual",
+              command=do_fix_position).pack(anchor="w")
     tk.Label(right, text="Sobre el GIF: arrastra para mover.\nTamano con el % del editor.",
              wraplength=280, justify="left").pack(anchor="w")
 
@@ -947,6 +1036,7 @@ def main():
     sync_editor_from_config()
     refresh_lock()
     refresh_status_line()
+    root.report_callback_exception = _log_err
     root.mainloop()
 
 

@@ -88,6 +88,8 @@ Opciones:
   --stop-all         Detiene todas las instancias
   --status           Muestra si hay instancia corriendo (codigo 0/1)
   --list             Lista instancias y su estado
+  --where            Geometria real "TITULO X Y W H" (KDE + kdotool).
+                   Con --id, solo esa. Sin --id, todas las visibles
   --get CLAVE        Imprime FILE|MODE|SIZE|POS|LOCKED|OPACITY|REV de la instancia
   --lock             Bloquea (guarda + relanza si corre, vuelve a su sitio)
   --unlock           Desbloquea (guarda + relanza si corre)
@@ -393,6 +395,30 @@ autostart_all() {
     msg "instancias lanzadas: $n"
 }
 
+cmd_where() {
+    # Geometria REAL via kdotool (KDE): "TITULO X Y W H" por linea.
+    # Con --id solo esa instancia; sin --id, todas las visibles.
+    have kdotool || die "--where necesita kdotool (sudo pacman -S kdotool)"
+    local u name geo x y w h found="no" line
+    while IFS= read -r u; do
+        [[ -n "$u" ]] || continue
+        name="$(kdotool getwindowname "$u" 2>/dev/null | head -n1)"
+        [[ "$name" =~ ^gifdesk(-[A-Za-z0-9_-]+)?$ ]] || continue
+        if [[ -n "$IID" && "$name" != "$TITLE" ]]; then
+            continue
+        fi
+        geo="$(kdotool getwindowgeometry "$u" 2>/dev/null)"
+        line="$(grep -E 'Position:' <<<"$geo" | head -n1 | grep -oE '[0-9-]+,[0-9-]+')"
+        x="${line%,*}"; y="${line#*,}"
+        line="$(grep -E 'Geometry:' <<<"$geo" | head -n1 | grep -oE '[0-9-]+x[0-9-]+')"
+        w="${line%x*}"; h="${line#*x}"
+        [[ -n "$x" && -n "$y" && -n "$w" && -n "$h" ]] || continue
+        printf '%s %s %s %s %s\n' "$name" "$x" "$y" "$w" "$h"
+        found="yes"
+    done < <(kdotool search --name "gifdesk" 2>/dev/null)
+    [[ "$found" == "yes" ]] || die "no se ve ventana gifdesk en pantalla"
+}
+
 cmd_stop() {
     local pid
     if pid="$(running_pid)"; then
@@ -638,6 +664,7 @@ main() {
             --status)    action="status"; shift ;;
             --list)      action="list"; shift ;;
             --rule-only) action="ruleonly"; shift ;;
+            --where)     action="where"; shift ;;
             --get)       [[ $# -ge 2 ]] || die "--get necesita una clave"; action="get"; getkey="$2"; shift 2 ;;
             --lock)      action="setlock"; newlock="yes"; shift ;;
             --unlock)    action="setlock"; newlock="no"; shift ;;
@@ -657,6 +684,7 @@ main() {
         status)  cmd_status; exit $? ;;
         list)    list_instances; exit 0 ;;
         stopall) cmd_stop_all; exit 0 ;;
+        where)   cmd_where; exit $? ;;
         get)
             case "$getkey" in
                 FILE|MODE|SIZE|POS|LOCKED|OPACITY|REV) ;;

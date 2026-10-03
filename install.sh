@@ -76,6 +76,14 @@ install_deps() {
     else
         msg "mpv ya instalado."
     fi
+    # kdotool (KDE): lee la geometria real para fijar posicion (opcional).
+    if ! command -v kdotool >/dev/null 2>&1; then
+        case "$FAM" in
+            arch) sudo pacman -S --needed --noconfirm kdotool 2>/dev/null \
+                    || msg "Aviso: sin kdotool (AUR/chaotic): sin fijar-posicion automatico" ;;
+            *)    msg "Aviso: instala kdotool si tu distro lo trae (fijar posicion real)" ;;
+        esac
+    fi
     # tkinter para la interfaz grafica (gifdesk-gui).
     if ! python3 -c "import tkinter" 2>/dev/null; then
         msg "Instalando tkinter para la interfaz grafica..."
