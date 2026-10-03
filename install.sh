@@ -108,10 +108,17 @@ if [[ -z "$GIF" ]]; then
     printf 'Ruta del GIF/WebP a mostrar (ej: ~/Descargas/rem.gif): '
     read -r GIF || true
 fi
-# Expandir solo ~/ inicial (no ~otro-usuario).
+# Normalizar ruta: ~/ -> HOME, relativa -> PWD actual.
+# Ademas repara el caso "$HOME/~/resto" (pegar rutas con ~ sin expandir).
 case "$GIF" in
     "~/"*) GIF="$HOME/${GIF#~/}" ;;
+    "~")   GIF="$HOME" ;;
+    /*)    ;;
+    *)     GIF="$PWD/$GIF" ;;
 esac
+if [[ "$GIF" == "$HOME/~/"* ]]; then
+    GIF="$HOME/${GIF#"$HOME/~/"}"
+fi
 [[ -f "$GIF" ]] || die "no existe: $GIF"
 case "$(printf '%s' "$GIF" | tr '[:upper:]' '[:lower:]')" in
     *.gif|*.webp) ;;
