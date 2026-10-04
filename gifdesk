@@ -565,6 +565,45 @@ build_mpv_args() {
     printf '%s\0' "${a[@]}"
 }
 
+strip_mpv_opt() {
+    # Quita --OPT y --OPT=* de un array (nameref $1, opcion $2).
+    local -n _arr="$1"
+    local _opt="$2" _t _kept=()
+    for _t in "${_arr[@]}"; do
+        [[ "$_t" == "--$_opt" || "$_t" == "--$_opt="* ]] || _kept+=("$_t")
+    done
+    _arr=("${_kept[@]}")
+}
+
+preflight_mpv_args() {
+    # Valida los args contra ESTE mpv sin abrir ventana (--vo=null,
+    # 1 cuadro). Si rechaza una opcion (mpv viejo/nuevo), se quita y se
+    # reintenta. Imprime args finales separados por NUL. Nunca falla por
+    # flags: en el peor caso lanza con menos adornos (lo registra en el log).
+    local -a pargs=("$@")
+    local tries=0 opt
+    local pflog="$CACHE_DIR/preflight.log"
+    while (( tries++ < 8 )); do
+        : >"$pflog" 2>/dev/null || true
+        if timeout 15 mpv --frames=1 --vo=null --ao=null --keep-open=no \
+                "${pargs[@]}" >>"$LOGFILE" 2>"$pflog"; then
+            break
+        fi
+        opt="$(sed -n 's/.*Error parsing option \([A-Za-z0-9-]*\).*/\1/p' "$pflog" \
+            | head -n1)"
+        if [[ -z "$opt" ]]; then
+            opt="$(sed -n 's/.*commandline option --\([A-Za-z0-9-]*\).*/\1/p' "$pflog" \
+                | head -n1)"
+        fi
+        if [[ -z "$opt" ]]; then
+            break  # fallo real (archivo, etc.): que lo reporte el lanzamiento
+        fi
+        strip_mpv_opt pargs "$opt"
+        log "preflight: flag no soportada por este mpv, quitada: --$opt"
+    done
+    printf '%s\0' "${pargs[@]}"
+}
+
 launch() {
     local f="$1" mode="$2" size="$3" pos="$4" dry="$5"
     local -a args=()
@@ -578,6 +617,13 @@ launch() {
         printf '\n'
         return 0
     fi
+
+    # Pre-vuelo: adapta los flags al mpv instalado (viejos/nuevos).
+    local -a final=()
+    while IFS= read -r -d '' tok; do
+        final+=("$tok")
+    done < <(preflight_mpv_args "${args[@]}")
+    args=("${final[@]}")
 
     if ! compositor_ok; then
         printf 'gifdesk: aviso: no se detecto compositor; la transparencia puede verse negra.\n' >&2
