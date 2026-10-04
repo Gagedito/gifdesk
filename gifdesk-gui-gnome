@@ -1,0 +1,998 @@
+#!/usr/bin/env python3
+# gifdesk-gui-gnome — gestora gráfica de gifdesk estilo GNOME/Adwaita.
+# GTK4 + libadwaita (se pide >= 1.2, la de Debian estable). Visualmente
+# distinta de gifdesk-gui-kde (tkinter): panel lateral + preferencias Adwaita.
+# Galería de GIF/WebP (añadir/borrar/mostrar) + editor por instancia
+# (tamaño, posición, opacidad, bloquear/desbloquear) + iniciar/detener.
+#
+# Notas GNOME (el motor es la extensión: actores Clutter, no ventanas):
+# - Sin dock/panel, sin alt-tab, siempre encima, opacidad real 0-100.
+# - "Fijar posición actual" lee la geometría del actor via D-Bus.
+import os
+import re
+import shutil
+import subprocess
+import sys
+import threading
+from pathlib import Path
+
+try:
+    import gi
+    gi.require_version("Gtk", "4.0")
+    gi.require_version("Adw", "1")
+    from gi.repository import Adw, Gio, GLib, Gtk
+    # libadwaita >= 1.2: ToastOverlay, MessageDialog. Sin 1.2 no arrancamos.
+    if not hasattr(Adw, "ToastOverlay") or not hasattr(Adw, "MessageDialog"):
+        raise ImportError("se necesita libadwaita >= 1.2")
+except (ImportError, ValueError) as e:
+    print(f"gifdesk-gui-gnome: faltan GTK4/libadwaita>=1.2 o PyGObject ({e}).", file=sys.stderr)
+    print("Debian/Ubuntu: sudo apt install python3-gi gir1.2-gtk-4.0 gir1.2-adw-1", file=sys.stderr)
+    print("Arch: sudo pacman -S gtk4 libadwaita python-gobject", file=sys.stderr)
+    print("Fedora: sudo dnf install gtk4 libadwaita python3-gobject", file=sys.stderr)
+    sys.exit(1)
+
+HOME = Path.home()
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config")) / "gifdesk"
+LEGACY_FILE = CONFIG_DIR / "gifdesk.conf"
+INST_DIR = CONFIG_DIR / "instances"
+LIB_DIR = HOME / ".local" / "share" / "gifdesk" / "library"
+BIN = shutil.which("gifdesk") or str(HOME / ".local" / "bin" / "gifdesk")
+EXT_UUID = "gifdesk-widgets@gifdesk.local"
+
+SUPPORTED = (".gif", ".webp")
+PRESETS = ["BR", "BL", "TR", "TL", "C", "Personalizada…"]
+
+
+# ---------- lógica de instancias (igual modelo que la GUI KDE) ----------
+
+def blank_cfg():
+    return {"FILE": "", "MODE": "widget", "SIZE": "", "POS": "BR",
+            "LOCKED": "no", "REV": "0", "OPACITY": "100"}
+
+
+def inst_id(path):
+    stem = Path(path).stem.lower().replace(" ", "-")
+    clean = "".join(c for c in stem if c.isalnum() or c in ("-", "_"))[:32]
+    clean = clean or "gif"
+    return "main-gif" if clean == "main" else clean
+
+
+def inst_conf(iid):
+    return INST_DIR / f"{iid}.conf"
+
+
+def read_config(path):
+    cfg = blank_cfg()
+    try:
+        for line in Path(path).read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k, v = k.strip(), v.strip().strip('"')
+            if k in cfg:
+                cfg[k] = v
+    except OSError:
+        pass
+    if cfg["LOCKED"] not in ("yes", "no"):
+        cfg["LOCKED"] = "no"
+    if not re.match(r"^\d+$", cfg.get("REV", "")):
+        cfg["REV"] = "0"
+    try:
+        op = int(cfg.get("OPACITY", "100"))
+    except (TypeError, ValueError):
+        op = 100
+    cfg["OPACITY"] = str(max(0, min(100, op)))
+    if cfg["POS"] not in ("TL", "TR", "BL", "BR", "C") and "," not in cfg["POS"]:
+        cfg["POS"] = "BR"
+    return cfg
+
+
+def write_config(cfg, path):
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(
+        "# gifdesk — configuración (la usa 'gifdesk --autostart')\n"
+        f'FILE="{cfg["FILE"]}"\n'
+        f'MODE={cfg.get("MODE", "widget")}\n'
+        f'SIZE={cfg.get("SIZE", "")}\n'
+        f'POS={cfg.get("POS", "BR")}\n'
+        f'LOCKED={cfg.get("LOCKED", "no")}\n'
+        f'REV={cfg.get("REV", "0")}\n'
+        f'OPACITY={cfg.get("OPACITY", "100")}\n'
+    )
+
+
+def bump_rev(path):
+    p = Path(path)
+    try:
+        lines = p.read_text().splitlines() if p.exists() else []
+    except OSError:
+        lines = []
+    rev = 0
+    out = []
+    for ln in lines:
+        if re.match(r"^\s*REV=", ln):
+            try:
+                rev = int(re.sub(r"\D", "", ln.split("=", 1)[1]) or 0)
+            except ValueError:
+                rev = 0
+            continue
+        out.append(ln)
+    out.append(f"REV={rev + 1}")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("\n".join(out) + "\n")
+    return rev + 1
+
+
+def resolve_id(path):
+    base = inst_id(path)
+    me = str(path)
+    iid, i = base, 0
+    while True:
+        conf = inst_conf(iid)
+        if not conf.exists():
+            return iid
+        try:
+            got = read_config(conf)["FILE"]
+        except OSError:
+            return iid
+        if got in ("", me):
+            return iid
+        i += 1
+        iid = f"{base}_{i}"
+
+
+def run_gifdesk(*args):
+    try:
+        p = subprocess.run([BIN, *args], capture_output=True, text=True, timeout=15)
+        return p.returncode, (p.stdout + p.stderr).strip()
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 1, str(e)
+
+
+def run_inst(iid, *args):
+    if iid:
+        return run_gifdesk("--id", iid, *args)
+    return run_gifdesk(*args)
+
+
+def is_running_inst(iid):
+    rc, _ = run_inst(iid, "--status")
+    return rc == 0
+
+
+def running_ids():
+    rc, out = run_gifdesk("--list")
+    ids = []
+    if rc == 0:
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[1] == "corriendo":
+                ids.append(parts[0])
+    return ids
+
+
+def engine_proxy():
+    """Proxy al motor GNOME (org.gifdesk.Widgets). None si no responde."""
+    try:
+        return Gio.DBusProxy.new_for_bus_sync(
+            Gio.BusType.SESSION, Gio.DBusProxyFlags.NONE, None,
+            "org.gifdesk.Widgets", "/org/gifdesk/Widgets",
+            "org.gifdesk.Widgets", None)
+    except GLib.Error:
+        return None
+
+
+def live_lock(iid, lock):
+    """Bloqueo en vivo via motor (sin relanzar). True si quedo puesto."""
+    px = engine_proxy()
+    if px is None:
+        return False
+    try:
+        ok = px.call_sync("SetLocked", GLib.Variant("(sb)", (iid, bool(lock))),
+                          Gio.DBusCallFlags.NONE, 5000, None).unpack()[0]
+        if not ok:
+            return False
+        return True
+    except GLib.Error:
+        return False
+
+
+def media_dims(path):
+    try:
+        p = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height,nb_frames",
+             "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, timeout=10)
+        parts = p.stdout.strip().split(",")
+        if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+            frames = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else None
+            return int(parts[0]), int(parts[1]), frames
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return None, None, None
+
+
+def file_info(path):
+    w, h, frames = media_dims(path)
+    if w and h:
+        extra = f" · {frames}f" if frames else ""
+        return f"{w}×{h}{extra}"
+    try:
+        kb = Path(path).stat().st_size // 1024
+        return f"{kb} KB"
+    except OSError:
+        return "?"
+
+
+def unique_dest(name):
+    dest = LIB_DIR / name
+    if not dest.exists():
+        return dest
+    stem, suf = os.path.splitext(name)
+    i = 1
+    while True:
+        cand = LIB_DIR / f"{stem}_{i}{suf}"
+        if not cand.exists():
+            return cand
+        i += 1
+
+
+def adopt_legacy(p_str, full=False):
+    legacy = read_config(LEGACY_FILE)
+    if not legacy["FILE"]:
+        return
+    if full or legacy["FILE"] == p_str:
+        if run_gifdesk("--status")[0] == 0:
+            run_gifdesk("--stop")
+        legacy["FILE"] = ""
+        write_config(legacy, LEGACY_FILE)
+
+
+def apply_live_geometry(iid, cfg):
+    """Lee X Y W H reales del motor y los guarda en la config + bump.
+    Devuelve (x, y, w, h) o None si no se ve."""
+    px = engine_proxy()
+    if px is None:
+        return None
+    try:
+        res = px.call_sync("Geometry", GLib.Variant("(s)", (iid,)),
+                           Gio.DBusCallFlags.NONE, 5000, None).unpack()[0]
+    except GLib.Error:
+        return None
+    if not res or res == "NONE":
+        return None
+    parts = res.split()
+    if len(parts) != 5:
+        return None
+    _iid, x, y, w, h = parts
+    if not (x.lstrip("-").isdigit() and y.lstrip("-").isdigit()
+            and w.isdigit() and h.isdigit()):
+        return None
+    x, y = max(0, int(x)), max(0, int(y))
+    w, h = max(48, int(w)), max(48, int(h))
+    cfg["POS"] = f"{x},{y}"
+    cfg["SIZE"] = f"{w}x{h}"
+    write_config(cfg, inst_conf(iid))
+    bump_rev(inst_conf(iid))
+    return x, y, w, h
+
+
+def ext_state():
+    """Estado del motor GNOME: enabled (responde) | missing (apagado)."""
+    px = engine_proxy()
+    if px is None:
+        return "missing"
+    try:
+        px.call_sync("List", None, Gio.DBusCallFlags.NONE, 5000, None)
+        return "enabled"
+    except GLib.Error:
+        return "missing"
+
+
+# ---------- widgets (solo GTK4 núcleo + Adw 1.0–1.2) ----------
+
+def spin_row(title, subtitle, lo, hi, step=1):
+    """Fila con etiqueta + Gtk.SpinButton. Devuelve (ListBoxRow, SpinButton)."""
+    row = Gtk.ListBoxRow(selectable=False, activatable=False)
+    box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+    box.set_margin_top(8)
+    box.set_margin_bottom(8)
+    box.set_margin_start(12)
+    box.set_margin_end(12)
+    lab = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+    lab.set_hexpand(True)
+    t = Gtk.Label(label=title, halign=Gtk.Align.START)
+    lab.append(t)
+    if subtitle:
+        s = Gtk.Label(label=subtitle, halign=Gtk.Align.START)
+        s.add_css_class("caption")
+        s.add_css_class("dim-label")
+        lab.append(s)
+    spin = Gtk.SpinButton(valign=Gtk.Align.CENTER)
+    spin.set_adjustment(Gtk.Adjustment(value=0, lower=lo, upper=hi,
+                                       step_increment=step,
+                                       page_increment=step * 10,
+                                       page_size=0))
+    spin.set_digits(0)
+    box.append(lab)
+    box.append(spin)
+    row.set_child(box)
+    return row, spin
+
+
+def action_button_row(title, subtitle, label, css=None):
+    """Adw.ActionRow con botón al final. Devuelve (row, button)."""
+    row = Adw.ActionRow(title=title)
+    if subtitle:
+        row.set_subtitle(subtitle)
+    btn = Gtk.Button(label=label, valign=Gtk.Align.CENTER)
+    if css:
+        btn.add_css_class(css)
+    row.add_suffix(btn)
+    return row, btn
+
+
+# ---------- aplicación ----------
+
+class GestorApp(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id="local.gifdesk.Gestor",
+                         flags=Gio.ApplicationFlags.FLAGS_NONE)
+        LIB_DIR.mkdir(parents=True, exist_ok=True)
+        INST_DIR.mkdir(parents=True, exist_ok=True)
+        self.cfg = blank_cfg()
+        self.cur_id = None
+        self._syncing = False
+
+    def do_activate(self):
+        win = Adw.ApplicationWindow(application=self)
+        win.set_title("gifdesk — gestor (GNOME)")
+        win.set_default_size(980, 680)
+
+        toast_overlay = Adw.ToastOverlay()
+        win.set_content(toast_overlay)
+        self.toast_overlay = toast_overlay
+
+        main = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        toast_overlay.set_child(main)
+
+        header = Adw.HeaderBar()
+        header.set_title_widget(Adw.WindowTitle(title="gifdesk",
+                                                subtitle="gestor · edición GNOME"))
+        main.append(header)
+
+        self.info_label = Gtk.Label(wrap=True, justify=Gtk.Justification.CENTER)
+        self.info_label.add_css_class("caption")
+        self.info_label.add_css_class("dim-label")
+        self.info_label.set_margin_top(4)
+        self.info_label.set_margin_bottom(4)
+        self.info_label.set_margin_start(12)
+        self.info_label.set_margin_end(12)
+        main.append(self.info_label)
+        main.append(Gtk.Separator())
+
+        paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+        paned.set_vexpand(True)
+        paned.set_position(320)
+        paned.set_shrink_start_child(False)
+        main.append(paned)
+
+        # --- lateral: galería ---
+        side = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        side.set_size_request(280, -1)
+        paned.set_start_child(side)
+        side_title = Gtk.Label(label="Galería (librería)", halign=Gtk.Align.START)
+        side_title.add_css_class("heading")
+        side_title.set_margin_top(8)
+        side_title.set_margin_start(12)
+        side_box = Gtk.ScrolledWindow(vexpand=True)
+        side_box.set_margin_top(6)
+        side_box.set_margin_start(6)
+        side_box.set_margin_end(6)
+        side.append(side_title)
+        side.append(side_box)
+        self.gallery = Gtk.ListBox(selection_mode=Gtk.SelectionMode.SINGLE)
+        self.gallery.add_css_class("boxed-list")
+        side_box.set_child(self.gallery)
+        self.gallery.connect("row-selected", self._on_row_selected)
+
+        side_btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        side_btns.set_margin_top(6)
+        side_btns.set_margin_bottom(6)
+        side_btns.set_margin_start(6)
+        side_btns.set_margin_end(6)
+        side.append(side_btns)
+        for label, fn, css in (("Añadir", self.do_add, None),
+                               ("Borrar", self.do_delete, None),
+                               ("Mostrar", self.do_show, "suggested-action")):
+            b = Gtk.Button(label=label)
+            b.set_hexpand(True)
+            if css:
+                b.add_css_class(css)
+            if fn in (self.do_add, self.do_delete):
+                b.connect("clicked", lambda _b, f=fn: f(win))
+            else:
+                b.connect("clicked", lambda _b: fn())
+            side_btns.append(b)
+
+        # --- contenido: editor ---
+        content_scroll = Gtk.ScrolledWindow(vexpand=True)
+        paned.set_end_child(content_scroll)
+        page = Adw.PreferencesPage()
+        content_scroll.set_child(page)
+
+        g_file = Adw.PreferencesGroup(title="GIF seleccionado")
+        page.add(g_file)
+        self.row_current = Adw.ActionRow(title="(ninguno)")
+        self.row_current.set_subtitle("Elige uno en la galería y pulsa Mostrar")
+        g_file.add(self.row_current)
+
+        pic_row = Gtk.ListBoxRow(selectable=False, activatable=False)
+        pic_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        pic_box.set_halign(Gtk.Align.CENTER)
+        pic_box.set_margin_top(6)
+        pic_box.set_margin_bottom(6)
+        self.preview = Gtk.Picture()
+        self.preview.set_content_fit(Gtk.ContentFit.SCALE_DOWN)
+        self.preview.set_size_request(220, 220)
+        pic_box.append(self.preview)
+        pic_row.set_child(pic_box)
+        pic_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        pic_list.add_css_class("boxed-list")
+        pic_list.append(pic_row)
+        g_file.add(pic_list)
+        pic_cap = Gtk.Label(label="Vista previa: primer cuadro (la animación se ve en pantalla)")
+        pic_cap.add_css_class("caption")
+        pic_cap.add_css_class("dim-label")
+        g_file.add(pic_cap)
+
+        g_size = Adw.PreferencesGroup(title="Tamaño",
+                                      description="Ancho/alto a 0 = resolución nativa del archivo.")
+        page.add(g_size)
+        size_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        size_list.add_css_class("boxed-list")
+        self.row_w, self.spin_w = spin_row("Ancho", None, 0, 4096)
+        self.row_h, self.spin_h = spin_row("Alto", None, 0, 4096)
+        self.row_pct, self.spin_pct = spin_row("Escala % (100 = real)", None, 25, 200)
+        self.spin_pct.get_adjustment().set_value(100)
+        self.spin_pct.connect("value-changed", self._on_pct)
+        size_list.append(self.row_w)
+        size_list.append(self.row_h)
+        size_list.append(self.row_pct)
+        g_size.add(size_list)
+        row_nat, btn_nat = action_button_row("Resolución nativa",
+                                             "Rellena el tamaño real y lo aplica al instante",
+                                             "Nativo")
+        btn_nat.connect("clicked", lambda _b: self.do_native())
+        nat_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        nat_list.add_css_class("boxed-list")
+        nat_list.append(row_nat)
+        g_size.add(nat_list)
+
+        g_pos = Adw.PreferencesGroup(
+            title="Posición",
+            description="El motor dibuja actores sin ventana: sin dock ni alt-tab, siempre encima.")
+        page.add(g_pos)
+        pos_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        pos_list.add_css_class("boxed-list")
+        preset_row = Gtk.ListBoxRow(selectable=False, activatable=False)
+        preset_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        preset_box.set_margin_top(8)
+        preset_box.set_margin_bottom(8)
+        preset_box.set_margin_start(12)
+        preset_box.set_margin_end(12)
+        preset_lab = Gtk.Label(label="Esquina", halign=Gtk.Align.START)
+        preset_lab.set_hexpand(True)
+        preset_box.append(preset_lab)
+        self.dropdown = Gtk.DropDown(model=Gtk.StringList.new(PRESETS),
+                                     selected=0, valign=Gtk.Align.CENTER)
+        self.dropdown.connect("notify::selected", self._on_preset)
+        preset_box.append(self.dropdown)
+        preset_row.set_child(preset_box)
+        pos_list.append(preset_row)
+        self.row_x, self.spin_x = spin_row("X", None, 0, 16384)
+        self.row_y, self.spin_y = spin_row("Y", None, 0, 16384)
+        pos_list.append(self.row_x)
+        pos_list.append(self.row_y)
+        g_pos.add(pos_list)
+
+        g_win = Adw.PreferencesGroup(title="Ventana")
+        page.add(g_win)
+        win_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        win_list.add_css_class("boxed-list")
+        self.row_opa, self.spin_opa = spin_row(
+            "Opacidad %", "Opacidad real del actor (0 = invisible, sigue corriendo).",
+            0, 100)
+        self.spin_opa.get_adjustment().set_value(100)
+        win_list.append(self.row_opa)
+        self.row_lock = Adw.ActionRow(title="Posición: libre")
+        self.row_lock.set_subtitle("Libre = se puede mover · Bloqueada = ignora el ratón")
+        win_list.append(self.row_lock)
+        g_win.add(win_list)
+
+        g_act = Adw.PreferencesGroup(title="Acciones")
+        page.add(g_act)
+        act_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        act_list.add_css_class("boxed-list")
+        row_apply, self.btn_apply = action_button_row(
+            "Guardar y aplicar", "Relanza esa instancia con lo nuevo",
+            "Aplicar cambios", css="suggested-action")
+        self.btn_apply.connect("clicked", lambda _b: self.do_apply())
+        act_list.append(row_apply)
+        row_lockbtn, self.btn_lock = action_button_row(
+            "Bloqueo del ratón", None, "Bloquear posición")
+        self.btn_lock.connect("clicked", lambda _b: self.do_lock_toggle())
+        act_list.append(row_lockbtn)
+        row_fix, btn_fix = action_button_row(
+            "Fijar dónde está",
+            "Guarda la posición/tamaño donde está ahora mismo",
+            "Fijar posición actual")
+        btn_fix.connect("clicked", lambda _b: self.do_fix())
+        act_list.append(row_fix)
+        row_run = Adw.ActionRow(title="Mostrar / ocultar")
+        run_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        btn_start = Gtk.Button(label="Iniciar")
+        btn_start.connect("clicked", lambda _b: self.do_start())
+        btn_stop = Gtk.Button(label="Detener")
+        btn_stop.connect("clicked", lambda _b: self.do_stop())
+        run_box.append(btn_start)
+        run_box.append(btn_stop)
+        row_run.add_suffix(run_box)
+        act_list.append(row_run)
+        self.row_status = Adw.ActionRow(title="Estado: sin selección")
+        act_list.append(self.row_status)
+        g_act.add(act_list)
+
+        win.present()
+        self.refresh_banner()
+        self.refresh_list()
+
+    # ---------- utilidades UI ----------
+
+    def toast(self, msg):
+        self.toast_overlay.add_toast(Adw.Toast.new(msg))
+
+    def in_thread(self, fn, done):
+        def run():
+            try:
+                res = fn()
+            except Exception as e:  # noqa: BLE001
+                res = (1, str(e))
+
+            def idle():
+                done(res)
+                return False
+            GLib.idle_add(idle)
+        threading.Thread(target=run, daemon=True).start()
+
+    def refresh_banner(self):
+        st = ext_state()
+        if st == "enabled":
+            self.info_label.set_text("Motor GNOME activo: actores sin ventana (sin dock ni alt-tab), siempre encima, opacidad real.")
+        else:
+            self.info_label.set_text("Motor GNOME apagado: instala/activa la extensión gifdesk (install.sh --with-gnome o el flake) y re-loguea.")
+
+    def library_files(self):
+        return sorted(
+            (p for p in LIB_DIR.iterdir()
+             if p.is_file() and p.suffix.lower() in SUPPORTED),
+            key=lambda p: p.name.lower())
+
+    def selected_path(self):
+        row = self.gallery.get_selected_row()
+        return getattr(row, "_path", None) if row is not None else None
+
+    # ---------- galería ----------
+
+    def refresh_list(self, select_name=None):
+        if select_name is None:
+            p0 = self.selected_path()
+            select_name = p0.name if p0 else None
+        while True:
+            child = self.gallery.get_first_child()
+            if child is None:
+                break
+            self.gallery.remove(child)
+        files = self.library_files()
+        sel_row = None
+        for p in files:
+            iid = resolve_id(p)
+            on = is_running_inst(iid)
+            mark = " · en pantalla" if on else ""
+            row = Adw.ActionRow(title=p.name)
+            row.set_subtitle(f"{file_info(p)}{mark}")
+            row._path = p
+            self.gallery.append(row)
+            if select_name is not None and p.name == select_name:
+                sel_row = row
+        if sel_row is not None:
+            self.gallery.select_row(sel_row)
+        elif self.gallery.get_first_child() is not None and self.gallery.get_selected_row() is None:
+            self.gallery.select_row(self.gallery.get_row_at_index(0))
+        self.load_selection()
+
+    def _on_row_selected(self, _box, _row):
+        self.load_selection()
+
+    def load_selection(self):
+        p = self.selected_path()
+        if p is None:
+            self.cur_id = None
+            self.cfg = blank_cfg()
+        else:
+            self.cur_id = resolve_id(p)
+            self.cfg = read_config(inst_conf(self.cur_id))
+            if not self.cfg["FILE"]:
+                self.cfg["FILE"] = str(p)
+        self.sync_editor()
+        self.refresh_lock()
+        self.refresh_current()
+        self.refresh_status()
+
+    def refresh_current(self):
+        f = self.cfg["FILE"]
+        base = Path(f).name if f else "(ninguno)"
+        if self.cur_id:
+            self.row_current.set_title(f"{base}  [instancia: {self.cur_id}]")
+        else:
+            self.row_current.set_title(base)
+
+    def refresh_status(self):
+        if self.cur_id and is_running_inst(self.cur_id):
+            self.row_status.set_title(f"Estado: {self.cur_id} mostrando en pantalla")
+        elif self.cur_id:
+            self.row_status.set_title(f"Estado: {self.cur_id} detenido")
+        else:
+            self.row_status.set_title("Estado: sin selección")
+
+    def refresh_lock(self):
+        locked = self.cfg.get("LOCKED", "no") == "yes"
+        self.row_lock.set_title("Posición: BLOQUEADA (ignora el ratón)" if locked
+                                else "Posición: libre (se puede mover)")
+        self.btn_lock.set_label("Desbloquear posición" if locked else "Bloquear posición")
+
+    # ---------- editor ----------
+
+    def sync_editor(self):
+        self._syncing = True
+        try:
+            size = self.cfg.get("SIZE", "")
+            w = h = 0
+            if size and "x" in size.lower():
+                try:
+                    w, h = (int(x.strip()) for x in size.lower().split("x", 1))
+                except ValueError:
+                    w = h = 0
+            self.spin_w.set_value(w)
+            self.spin_h.set_value(h)
+            try:
+                dims = media_dims(self.cfg["FILE"]) if self.cfg.get("FILE") else (None, None, None)
+                w0, h0 = dims[0], dims[1]
+                if w and h and w0 and h0:
+                    self.spin_pct.set_value(max(25, min(200, round(w * 100 / w0))))
+                else:
+                    self.spin_pct.set_value(100)
+            except (ValueError, ZeroDivisionError):
+                self.spin_pct.set_value(100)
+            try:
+                self.spin_opa.set_value(int(self.cfg.get("OPACITY", "100")))
+            except (TypeError, ValueError):
+                self.spin_opa.set_value(100)
+            pos = self.cfg.get("POS", "BR")
+            if pos in PRESETS[:5]:
+                self.dropdown.set_selected(PRESETS.index(pos))
+                self.row_x.set_visible(False)
+                self.row_y.set_visible(False)
+            else:
+                self.dropdown.set_selected(5)
+                self.row_x.set_visible(True)
+                self.row_y.set_visible(True)
+                if "," in pos:
+                    try:
+                        x, y = (int(v.strip()) for v in pos.split(",", 1))
+                        self.spin_x.set_value(max(0, x))
+                        self.spin_y.set_value(max(0, y))
+                    except ValueError:
+                        pass
+            f = self.cfg.get("FILE", "")
+            if f and Path(f).exists():
+                try:
+                    self.preview.set_filename(f)
+                    self.row_current.set_subtitle(file_info(Path(f)))
+                except (GLib.Error, TypeError):
+                    self.preview.set_paintable(None)
+            else:
+                self.preview.set_paintable(None)
+        finally:
+            self._syncing = False
+
+    def _on_pct(self, _spin):
+        if self._syncing or not self.cfg.get("FILE"):
+            return
+        w0, h0, _ = media_dims(self.cfg["FILE"])
+        if w0 and h0:
+            pc = int(self.spin_pct.get_value())
+            self.spin_w.set_value(max(48, round(w0 * pc / 100)))
+            self.spin_h.set_value(max(48, round(h0 * pc / 100)))
+
+    def _on_preset(self, _dropdown, _pspec):
+        custom = self.dropdown.get_selected() == 5
+        self.row_x.set_visible(custom)
+        self.row_y.set_visible(custom)
+
+    def collect_editor(self):
+        w, h = int(self.spin_w.get_value()), int(self.spin_h.get_value())
+        if w or h:
+            if w <= 0 or h <= 0:
+                return None, "Ancho/alto: pon ambos o ambos a 0 (= nativo)"
+            self.cfg["SIZE"] = f"{w}x{h}"
+        else:
+            self.cfg["SIZE"] = ""
+        if self.dropdown.get_selected() == 5:
+            self.cfg["POS"] = f"{int(self.spin_x.get_value())},{int(self.spin_y.get_value())}"
+        else:
+            self.cfg["POS"] = PRESETS[self.dropdown.get_selected()]
+        self.cfg["OPACITY"] = str(int(self.spin_opa.get_value()))
+        return True, ""
+
+    # ---------- acciones ----------
+
+    def do_add(self, win):
+        dlg = Gtk.FileChooserNative(title="Añadir GIF / WebP",
+                                    transient_for=win,
+                                    action=Gtk.FileChooserAction.OPEN,
+                                    accept_label="_Añadir",
+                                    cancel_label="_Cancelar")
+        flt = Gtk.FileFilter()
+        flt.set_name("GIF/WebP")
+        flt.add_pattern("*.gif")
+        flt.add_pattern("*.webp")
+        flt.add_pattern("*.GIF")
+        flt.add_pattern("*.WEBP")
+        dlg.set_filter(flt)
+
+        def on_response(native, resp):
+            if resp == Gtk.ResponseType.ACCEPT:
+                f = native.get_file()
+                src = f.get_path() if f else None
+                if src and Path(src).suffix.lower() in SUPPORTED:
+                    dest = unique_dest(Path(src).name)
+                    try:
+                        shutil.copy2(src, dest)
+                        self.refresh_list(select_name=dest.name)
+                        self.toast(f"Añadido: {dest.name}")
+                    except OSError as e:
+                        self.toast(f"No se pudo copiar: {e}")
+                else:
+                    self.toast("Solo .gif / .webp")
+            native.destroy()
+
+        dlg.connect("response", on_response)
+        dlg.show()
+
+    def do_delete(self, win):
+        p = self.selected_path()
+        if p is None:
+            return
+        dlg = Adw.MessageDialog.new(win, "Borrar de la librería?",
+                                    f"{p.name}\nSe elimina el archivo y su instancia.")
+        dlg.add_responses("cancel", "_Cancelar", "ok", "_Borrar")
+        dlg.set_response_appearance("ok", Adw.ResponseAppearance.DESTRUCTIVE)
+        dlg.set_default_response("cancel")
+        dlg.set_close_response("cancel")
+
+        def on_response(d, resp):
+            if resp == "ok":
+                iid = resolve_id(p)
+                run_inst(iid, "--stop")
+                try:
+                    inst_conf(iid).unlink(missing_ok=True)
+                except OSError:
+                    pass
+                try:
+                    p.unlink()
+                except OSError as e:
+                    self.toast(f"No se pudo borrar: {e}")
+                    return
+                self.refresh_list()
+                self.toast(f"Borrado: {p.name}")
+        dlg.connect("response", on_response)
+        dlg.present()
+
+    def do_show(self):
+        p = self.selected_path()
+        if p is None:
+            return
+        iid = resolve_id(p)
+        self.cur_id = iid
+        self.cfg["FILE"] = str(p)
+        write_config(self.cfg, inst_conf(iid))
+        bump_rev(inst_conf(iid))
+        adopt_legacy(str(p), full=True)
+        self.refresh_current()
+        self.refresh_list(select_name=p.name)
+        self.toast("Mostrando…")
+
+        def done(res):
+            rc, out = res
+            if rc != 0:
+                self.toast(f"No se pudo mostrar: {out[:200]}")
+            self.refresh_list(select_name=p.name)
+
+        self.in_thread(lambda: run_inst(iid, "--autostart"), done)
+
+    def do_native(self):
+        if self.cfg.get("FILE"):
+            w0, h0, _ = media_dims(self.cfg["FILE"])
+            if w0 and h0:
+                self.spin_w.set_value(w0)
+                self.spin_h.set_value(h0)
+        else:
+            self.spin_w.set_value(0)
+            self.spin_h.set_value(0)
+        self.spin_pct.set_value(100)
+        self.do_apply()
+
+    def do_apply(self):
+        ok, err = self.collect_editor()
+        if not ok:
+            self.toast(err)
+            return
+        iid = self.cur_id
+        if iid is None:
+            self.toast("Selecciona un GIF de la galería")
+            return
+        adopt_legacy(self.cfg.get("FILE", ""))
+        disk = read_config(inst_conf(iid))
+        changed = {k for k in ("SIZE", "MODE", "POS", "OPACITY")
+                   if self.cfg.get(k, "") != disk.get(k, "")}
+        write_config(self.cfg, inst_conf(iid))
+        if changed:
+            bump_rev(inst_conf(iid))
+        if not self.cfg["FILE"]:
+            self.toast("Sin archivo actual: elige uno y pulsa Mostrar")
+            return
+        if not changed and is_running_inst(iid):
+            self.refresh_status()
+            self.toast(f"Sin cambios (sigue igual @ {self.cfg['POS'] or 'nativo'})")
+            return
+        if changed == {"OPACITY"} and is_running_inst(iid):
+            # Solo opacidad: reaplicar en vivo (el actor la toma al vuelo).
+            self.toast("Aplicando opacidad en vivo…")
+
+            def done_op(res):
+                rc, out = res
+                if rc != 0:
+                    self.toast(f"No se pudo aplicar: {out[:200]}")
+                else:
+                    self.toast(f"Opacidad: {self.cfg['OPACITY']}%")
+                self.sync_editor()
+                self.refresh_status()
+
+            self.in_thread(lambda: run_inst(iid, "--autostart"), done_op)
+            return
+        self.toast("Aplicando…")
+        self.btn_apply.set_sensitive(False)
+
+        def done(res):
+            rc, out = res
+            if rc != 0:
+                self.toast(f"No se pudo aplicar: {out[:200]}")
+            else:
+                self.toast(f"Aplicado: {self.cfg['SIZE'] or 'nativo'} @ {self.cfg['POS']}")
+            self.sync_editor()
+            self.refresh_status()
+            self.btn_apply.set_sensitive(True)
+
+        self.in_thread(lambda: run_inst(iid, "--autostart"), done)
+
+    def do_lock_toggle(self):
+        iid = self.cur_id
+        if iid is None:
+            self.toast("Selecciona un GIF de la galería")
+            return
+        if not is_running_inst(iid):
+            others = [i for i in running_ids() if i != iid]
+            if others:
+                self.toast(f"'{iid}' no se muestra. En pantalla: {', '.join(others)}")
+            else:
+                self.toast("Ningún GIF se está mostrando")
+            self.refresh_status()
+            return
+        new_lock = "no" if self.cfg.get("LOCKED") == "yes" else "yes"
+        lock = new_lock == "yes"
+        self.toast(f"{'Bloqueando' if lock else 'Desbloqueando'} {iid}…")
+
+        def work():
+            live = apply_live_geometry(iid, self.cfg)
+            self.cfg["LOCKED"] = new_lock
+            adopt_legacy(self.cfg.get("FILE", ""))
+            write_config(self.cfg, inst_conf(iid))
+            if live is None:
+                bump_rev(inst_conf(iid))
+            if live_lock(iid, lock):
+                return ("live", None)
+            return ("relaunch", None)
+
+        def done(res):
+            kind, _out = res
+            if kind == "live":
+                verb = "Bloqueado" if lock else "Desbloqueado"
+                self.toast(f"{verb} {iid} donde está (en vivo)")
+                self.refresh_lock()
+                self.refresh_status()
+                self.sync_editor()
+            else:
+                self.toast("Sin respuesta en vivo, relanzando…")
+
+                def done2(res2):
+                    rc, out = res2
+                    if rc != 0:
+                        self.toast(f"No se pudo aplicar: {out[:200]}")
+                    else:
+                        verb = "Bloqueado" if lock else "Desbloqueado"
+                        self.toast(f"{verb} {iid} en su sitio ({self.cfg['POS'] or 'BR'})")
+                    self.refresh_lock()
+                    self.refresh_status()
+                    self.sync_editor()
+
+                self.in_thread(lambda: run_inst(iid, "--autostart"), done2)
+
+        self.in_thread(work, done)
+
+    def do_fix(self):
+        iid = self.cur_id
+        if iid is None:
+            self.toast("Selecciona un GIF de la galería")
+            return
+        if not is_running_inst(iid):
+            self.toast("Ese GIF no se está mostrando")
+            return
+        got = apply_live_geometry(iid, self.cfg)
+        if got is None:
+            self.toast("No veo el actor: revisa que el motor GNOME esté activo")
+            return
+        x, y, w, h = got
+        self.sync_editor()
+        self.refresh_status()
+        self.toast(f"Fijado donde está: {w}x{h} @ {x},{y}")
+
+    def do_start(self):
+        iid = self.cur_id
+        if not self.cfg["FILE"] or iid is None:
+            self.toast("Elige un archivo y pulsa Mostrar")
+            return
+        adopt_legacy(self.cfg["FILE"])
+        write_config(self.cfg, inst_conf(iid))
+        self.toast("Iniciando…")
+
+        def done(_res):
+            self.refresh_list()
+            self.refresh_status()
+
+        self.in_thread(lambda: run_inst(iid, "--autostart"), done)
+
+    def do_stop(self):
+        iid = self.cur_id
+        self.toast("Deteniendo…")
+
+        def done(_res):
+            self.refresh_list()
+            self.refresh_status()
+
+        if iid is None:
+            done((0, ""))
+        else:
+            self.in_thread(lambda: run_inst(iid, "--stop"), done)
+
+
+def main():
+    app = GestorApp()
+    return app.run(sys.argv)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

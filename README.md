@@ -10,10 +10,12 @@ cada uno independiente, con **bajo consumo** (mpv + decodificacion por hardware)
 ![Artix](https://img.shields.io/badge/Artix-ok-10A0CC?logo=artixlinux)
 ![Fedora](https://img.shields.io/badge/Fedora-ok-294172?logo=fedora)
 ![KDE](https://img.shields.io/badge/KDE-ok-1abc9c)
+![GNOME](https://img.shields.io/badge/GNOME-ok-4a86cf)
 ![Hyprland](https://img.shields.io/badge/Hyprland-ok-00e5cc)
 ![XFCE](https://img.shields.io/badge/XFCE-ok-07a3e0)
 
-> Probado en Artix Linux (runit, Plasma Wayland) con mpv 0.41.
+> Probado en Artix Linux (runit, Plasma Wayland) con mpv 0.41, y en GNOME
+> Wayland (Shell 50) con la edición GNOME + extensión de posicionamiento.
 
 - [Requisitos](#requisitos)
 - [Instalacion](#instalacion)
@@ -38,6 +40,10 @@ cada uno independiente, con **bajo consumo** (mpv + decodificacion por hardware)
 - `mpv`, `ffmpeg`, `python3` + `tkinter` (el instalador los pone por ti).
 - En KDE Wayland: `kwriteconfig6`, `kreadconfig6` y `qdbus6` (vienen con Plasma)
   para colocar y recordar tamano/posicion/opacidad via regla KWin.
+- En GNOME Wayland: `gifdesk-gui-gnome` (GTK4 + libadwaita >= 1.2 + PyGObject)
+  y la extension `gifdesk` (incluida en `extensions/`, se instala con
+  `--with-gnome`): es el motor, dibuja actores Clutter sin ventanas
+  (sin dock ni alt-tab, siempre encima, opacidad real).
 
 ## Instalacion
 
@@ -46,12 +52,12 @@ cd ~/gifdesk
 chmod +x gifdesk install.sh uninstall.sh
 ./install.sh --file ~/Descargas/rem.gif
 ```
-
 | Flag | Descripcion |
 |------|-------------|
 | `--file RUTA` | GIF/WebP a mostrar (defecto: `~/Descargas/rem.gif` si existe) |
 | `--with-hypr` | Ademas registra autostart en Hyprland (`execs.lua`) |
 | `--with-systemd` | Ademas instala la unidad de usuario systemd |
+| `--with-gnome` | Instala la GUI GNOME + la extension de posicionamiento (en sesion GNOME se hace solo) |
 | `-y, --yes` | No preguntar |
 
 Que hace:
@@ -66,6 +72,34 @@ Que hace:
 5. Si hay Hyprland, te dice como (o lo hace con `--with-hypr`).
 6. Corre `gifdesk --check` como verificacion.
 
+### NixOS (flake, recomendado en NixOS en vez de `install.sh`)
+
+Este repo es un flake (`flake.nix`): empaqueta visor + GUIs + extensión +
+`.desktop`, y trae módulo home-manager (`homeManagerModules.gifdesk`).
+
+```bash
+nix run .#gifdesk -- --check --file ~/anim.gif   # probar sin instalar
+nix profile install .#gifdesk                     # instalar en tu perfil
+```
+
+Con home-manager en tu flake:
+
+```nix
+inputs.gifdesk.url = "path:/home/sabrina/Projects/gifdesk";  # o github:...
+
+home-manager.users.sabrina = {
+  imports = [ inputs.gifdesk.homeManagerModules.gifdesk ];
+  programs.gifdesk = {
+    enable = true;
+    package = inputs.gifdesk.packages.${pkgs.system}.gifdesk;
+    gnomeExtension = true;
+  };
+};
+```
+
+Tras activar la extensión (`gnome-extensions enable gifdesk-widgets@gifdesk.local`)
+cierra e inicia sesión (Wayland) y confirma con `gifdesk --check`.
+
 ## Inicio rapido
 
 ```bash
@@ -79,8 +113,29 @@ gifdesk-gui   # o "gifdesk gestor" en el menu de aplicaciones
 
 ## Interfaz grafica
 
-Ventana con dos paneles (tkinter, sin dependencias extra). **Cierra y vuelve a
-abrirla tras actualizar**, para no usar codigo viejo.
+Hay **dos ediciones con aspecto distinto**, y `gifdesk-gui` elige sola segun
+el escritorio (`--gnome` / `--kde` para forzarla):
+
+| Edición | Toolkit / estilo | Cuándo se abre |
+|---|---|---|
+| `gifdesk-gui-gnome` | GTK4 + libadwaita (Adwaita: panel lateral, preferencias, toasts) | Sesión GNOME |
+| `gifdesk-gui-kde` | tkinter (la clásica, estilo Plasma) | Resto (KDE, XFCE, Hyprland…) |
+
+```bash
+gifdesk-gui           # selector automatico (o "gifdesk gestor" en el menu)
+gifdesk-gui --gnome   # forzar edicion GNOME
+gifdesk-gui --kde     # forzar edicion KDE/clasica
+```
+
+Las dos gestionan las mismas instancias y configs (`instances/<id>.conf`);
+solo cambia la presentación. Diferencias honestas de la edición GNOME:
+
+- Vista previa **estática** (primer cuadro; la animación se ve en pantalla).
+- Cabecera con el estado del **motor** (activo/apagado).
+
+La edición KDE es una ventana con dos paneles (tkinter, sin dependencias
+extra). **Cierra y vuelve a abrirla tras actualizar**, para no usar codigo
+viejo (vale para ambas ediciones).
 
 ### Galeria (libreria)
 
@@ -169,7 +224,8 @@ gifdesk --dry-run --file rem.gif          # ver el comando mpv sin abrir ventana
 
 | Ruta | Que es |
 |------|--------|
-| `~/.local/bin/gifdesk`, `gifdesk-gui` | Binarios instalados |
+| `~/.local/bin/gifdesk`, `gifdesk-gui`, `gifdesk-gui-kde`, `gifdesk-gui-gnome` | Binarios instalados (visor + selector + ediciones KDE/GNOME) |
+| `~/.local/share/gnome-shell/extensions/gifdesk-widgets@gifdesk.local/` | Extension de posicionamiento (solo GNOME) |
 | `~/.local/share/gifdesk/library/` | Tus GIF/WebP (copias de trabajo) |
 | `~/.config/gifdesk/gifdesk.conf` | Config clasica (legado; la GUI la vacia al adoptar) |
 | `~/.config/gifdesk/instances/<id>.conf` | Config por instancia: `FILE MODE SIZE POS LOCKED REV OPACITY` |
@@ -221,6 +277,27 @@ animado en ningun reproductor); el ahorro esta en lo demas (sin audio/OSD, un
 proceso por GIF, compositing en GPU). La GUI cerrada consume cero. Para bajarlo:
 tamano menor, menos fps, o Detener cuando no mires.
 
+## GNOME (Wayland)
+
+En GNOME no hay ventanas mpv: el motor es la **extensión `gifdesk`**, que
+dibuja cada instancia como un **actor Clutter** (no una ventana):
+
+- Sin dock/panel, sin alt-tab, sin taskbar. Todo se maneja desde el gestor.
+- Siempre encima y en todos los escritorios (con arrastre si está libre).
+- **Opacidad real** 0-100 del actor (aquí sí aplica).
+- Posición/tamaño exactos por instancia; `gifdesk --where` y fijar posición
+  leen la geometría del actor.
+
+```bash
+./install.sh --with-gnome   # en sesion GNOME se hace solo (o usa el flake)
+gifdesk --check             # confirma: motor activo
+```
+
+Tras activar la extensión (`gnome-extensions enable gifdesk-widgets@gifdesk.local`)
+cierra e inicia sesión (Wayland). Sin el motor activo, los comandos fallan
+con un error claro (o actores exactos o nada, sin centrados a medias).
+La GUI GNOME indica en su cabecera si el motor está activo o apagado.
+
 ## Autostart por entorno
 
 | Entorno | Metodo |
@@ -233,17 +310,24 @@ tamano menor, menos fps, o Detener cuando no mires.
 
 ## Limitaciones conocidas
 
+- **GNOME sin motor**: los comandos fallan con error claro hasta activar la
+  extensión y re-loguear. Con el motor: actores exactos, sin dock ni alt-tab.
 - **Arrastrar vive la sesion**: al relanzar/reiniciar vuelve a su sitio
   configurado. KWin no expone la posicion para leerla (sin `kdotool` no hay
-  X/Y automatico).
+  X/Y automatico). En GNOME, "fijar posición actual" lee el actor via motor.
 - En Wayland el posicionamiento absoluto lo decide el compositor (+ regla en
   KDE); en otros Wayland sin reglas, la posicion inicial es aproximada.
 - Ventana bloqueada = ignora el raton del todo (ni mover, ni rueda, ni nada).
 - Opacidad 0 % = invisible pero activo (consume igual).
 - `--mode wallpaper` es pantalla completa por encima (fondo falso), no fondo real.
+  En GNOME no existe (solo widget: los actores ya van encima de todo).
 
 ## Solucion de problemas
 
+- **En GNOME `--where`/Mostrar fallan**: instala y activa la
+  extensión (`./install.sh --with-gnome` o el flake, luego cierra e inicia
+  sesión). Comprueba con `gifdesk --check` (debe decir motor activo) y
+  `gnome-extensions show gifdesk-widgets@gifdesk.local` (State: ACTIVE).
 - **Veo un rectangulo negro**: sin compositor, o tu archivo no tiene alfa.
   Corre `gifdesk --check --file tu.gif`.
 - **No aparece al iniciar**: revisa `~/.config/autostart/gifdesk.desktop` y
