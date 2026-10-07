@@ -269,7 +269,9 @@ ensure_kwin_rule() {
                kwriteconfig6 --file kwinrulesrc --group General --key count \
                    "$(tr ',' '\n' <<<"${rules:+$rules,}$RULE_ID" | grep -c .)" ;;
         esac
-        qdbus6 org.kde.KWin /KWin org.kde.KWin.reconfigure 2>/dev/null || true
+        # reconfigure con timeout: qdbus sin limite espera 25 s si KWin
+        # esta ocupado; no debe colgar el arranque.
+        timeout 8 qdbus6 org.kde.KWin /KWin org.kde.KWin.reconfigure 2>/dev/null || true
         log "regla kwin sincronizada rev=$rev: $x,$y ${w}x$h"
 }
 
@@ -423,28 +425,14 @@ cmd_stop() {
     # Detiene TODOS los mpv de esta instancia (pidfile + barrido por
     # titulo, para no dejar huerfanos de carreras pasadas).
     with_instance_lock
-    local pids pid p
-    pids="$(pgrep -f -- "--title=${TITLE}( |$)" 2>/dev/null || true)"
-    if pid="$(running_pid)"; then
-        pids="$(printf '%s\n%s' "$pid" "$pids")"
-    fi
-    pids="$(printf '%s\n' "$pids" | grep -E '^[0-9]+$' | sort -u || true)"
-    if [[ -z "$pids" ]]; then
+    touch "$CACHE_DIR/stopped-$TITLE" 2>/dev/null || true
+    if stop_existing; then
+        rm -f "$PIDFILE" "$SOCKET"
+        msg "gifdesk detenido."
+    else
         rm -f "$PIDFILE" "$SOCKET"
         msg "gifdesk no estaba en ejecucion."
-        return 0
     fi
-    for p in $pids; do
-        kill "$p" 2>/dev/null || true
-    done
-    sleep 0.5
-    for p in $pids; do
-        if kill -0 "$p" 2>/dev/null; then
-            kill -9 "$p" 2>/dev/null || true
-        fi
-    done
-    rm -f "$PIDFILE" "$SOCKET"
-    msg "gifdesk detenido."
 }
 
 cmd_stop_all() {
@@ -577,49 +565,36 @@ build_mpv_args() {
     printf '%s\0' "${a[@]}"
 }
 
-strip_mpv_opt() {
-    # Quita --OPT y --OPT=* de un array (nameref $1, opcion $2).
-    local -n _arr="$1"
-    local _opt="$2" _t _kept=()
-    for _t in "${_arr[@]}"; do
-        [[ "$_t" == "--$_opt" || "$_t" == "--$_opt="* ]] || _kept+=("$_t")
-    done
-    _arr=("${_kept[@]}")
-}
-
 preflight_mpv_args() {
-    # Valida los args contra ESTE mpv sin abrir ventana (--vo=null,
-    # 1 cuadro). Si rechaza una opcion (mpv viejo/nuevo), se quita y se
-    # reintenta. Imprime args finales separados por NUL. Nunca falla por
-    # flags: en el peor caso lanza con menos adornos (lo registra en el log).
+    # Adapta los flags al mpv instalado SIN ejecutarlo (un pre-vuelo con
+    # --vo=null se colgaba 15 s en bucle): se listan las opciones reales
+    # una vez y se quita lo desconocido (mpv viejos/nuevos). Rapido (<0.1s)
+    # y determinista. Los VALORES exoticos no se validan (riesgo residual
+    # minimo; el lanzamiento los reportaria en el log).
     local -a pargs=("$@")
-    local tries=0 opt
-    local pflog="$CACHE_DIR/preflight.log"
-    while (( tries++ < 8 )); do
-        : >"$pflog" 2>/dev/null || true
-        if timeout 15 mpv --frames=1 --vo=null --ao=null --keep-open=no \
-                "${pargs[@]}" >>"$LOGFILE" 2>"$pflog"; then
-            break
+    local optlist name alt t kept=()
+    optlist="$(mpv --list-options 2>/dev/null || true)"
+    for t in "${pargs[@]}"; do
+        if [[ "$t" == --* && "$t" != "--" ]]; then
+            name="${t#--}"; name="${name%%=*}"
+            # mpv lista la forma positiva (--audio); --no-X es negacion valida.
+            alt="$name"
+            [[ "$name" == no-* ]] && alt="${name#no-}"
+            if ! grep -qE "^ --${name}([[:space:]]|$)" <<<"$optlist" \
+            && ! grep -qE "^ --${alt}([[:space:]]|$)" <<<"$optlist"; then
+                log "preflight: flag no soportada por este mpv, quitada: --$name"
+                continue
+            fi
         fi
-        opt="$(sed -n 's/.*Error parsing option \([A-Za-z0-9-]*\).*/\1/p' "$pflog" \
-            | head -n1)"
-        if [[ -z "$opt" ]]; then
-            opt="$(sed -n 's/.*commandline option --\([A-Za-z0-9-]*\).*/\1/p' "$pflog" \
-                | head -n1)"
-        fi
-        if [[ -z "$opt" ]]; then
-            break  # fallo real (archivo, etc.): que lo reporte el lanzamiento
-        fi
-        strip_mpv_opt pargs "$opt"
-        log "preflight: flag no soportada por este mpv, quitada: --$opt"
+        kept+=("$t")
     done
-    printf '%s\0' "${pargs[@]}"
+    printf '%s\0' "${kept[@]}"
 }
 
 with_instance_lock() {
-    # Exclusion mutua por instancia (evita lanzamientos solapados por doble
-    # clic: uno mataba al otro = parpadeo; o dejaba huerfanos duplicados).
-    # Bloquea hasta 15 s y sigue; el FD se libera al salir el proceso.
+    # Exclusion mutua SOLO para operaciones sin spawn (cmd_stop): el FD se
+    # hereda a los hijos, asi que JAMAS se mantiene abierto al lanzar mpv
+    # (el lock duraria lo que el mpv y cada arranque esperaria 15 s).
     local lockf="$CACHE_DIR/$TITLE.lock"
     exec {GIFDESK_LOCK_FD}>"$lockf" 2>/dev/null || return 0
     if have flock; then
@@ -627,9 +602,29 @@ with_instance_lock() {
     fi
 }
 
+stop_existing() {
+    # Mata todos los mpv de esta instancia (sin lock: lo pone el llamante).
+    local pids p
+    pids="$(pgrep -f -- "--title=${TITLE}( |$)" 2>/dev/null || true)"
+    if pid="$(running_pid)"; then
+        pids="$(printf '%s\n%s' "$pid" "$pids")"
+    fi
+    pids="$(printf '%s\n' "$pids" | grep -E '^[0-9]+$' | sort -u || true)"
+    [[ -n "$pids" ]] || return 1
+    for p in $pids; do
+        kill "$p" 2>/dev/null || true
+    done
+    sleep 0.5
+    for p in $pids; do
+        if kill -0 "$p" 2>/dev/null; then
+            kill -9 "$p" 2>/dev/null || true
+        fi
+    done
+    return 0
+}
+
 launch() {
     local f="$1" mode="$2" size="$3" pos="$4" dry="$5"
-    with_instance_lock
     local -a args=()
     while IFS= read -r -d '' tok; do
         args+=("$tok")
@@ -654,10 +649,13 @@ launch() {
         log "aviso: sin compositor, alfa degradado"
     fi
 
-    # Instancia unica: si ya corre, se reemplaza.
-    if running_pid >/dev/null 2>&1; then
-        cmd_stop >/dev/null 2>&1 || true
-    fi
+    # Reemplazo serializado: el stop va en subshell con lock propio (ese
+    # proceso muere ahi mismo: ningun FD vivo llega al mpv nuevo). Siempre
+    # se pasa por el lock aunque no corra nada, para ordenar arranques
+    # simultaneos (doble clic): el ultimo gana, sin huerfanos vivos a medias.
+    ( flock -w 15 9 || exit 7
+      stop_existing >/dev/null 2>&1 || true
+    ) 9>"$CACHE_DIR/$TITLE.lock" 2>/dev/null || true
     mkdir -p "$CACHE_DIR"
     rm -f "$SOCKET"
     # Rotar log: mpv escribe una linea de estado por cuadro (a 50fps crece
@@ -675,10 +673,31 @@ launch() {
     sleep 0.6
     if kill -0 "$pid" 2>/dev/null; then
         msg "gifdesk mostrando: $f (pid $pid)"
+        watch_mpv "$pid" "$f"
     else
         rm -f "$PIDFILE"
         die "mpv termino de inmediato; revisa $LOGFILE"
     fi
+}
+
+watch_mpv() {
+    # Vigia: si el mpv muere SIN que nadie pidiera --stop, dejarlo escrito
+    # en el log (diagnostico de cuelgues/crashes). Cuesta ~nada (sleep).
+    local pid="$1" f="$2"
+    local flag="$CACHE_DIR/stopped-$TITLE" plog="$LOGFILE"
+    rm -f "$flag"
+    ( for ((i = 0; i < 360; i++)); do
+          kill -0 "$pid" 2>/dev/null || break
+          sleep 10
+      done
+      kill -0 "$pid" 2>/dev/null && return 0
+      if [[ -f "$flag" ]]; then
+          rm -f "$flag"
+      else
+          printf '[%s] MUERTE INESPERADA pid %s (%s): no fue --stop; revisa arriba errores mpv\n' \
+              "$APP" "$pid" "$f" >>"$plog" 2>/dev/null || true
+      fi ) >>"$plog" 2>&1 < /dev/null &
+    disown 2>/dev/null || true
 }
 
 load_config() {
