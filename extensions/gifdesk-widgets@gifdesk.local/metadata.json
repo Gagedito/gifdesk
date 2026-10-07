@@ -1,0 +1,7 @@
+{
+  "uuid": "gifdesk-widgets@gifdesk.local",
+  "name": "gifdesk widgets",
+  "description": "Motor gifdesk: dibuja cada GIF/WebP como actor Clutter (sin ventanas: sin dock ni alt-tab, siempre encima).",
+  "version": 1,
+  "shell-version": ["46", "47", "48", "49", "50"]
+}

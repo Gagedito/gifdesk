@@ -1,11 +1,15 @@
 #!/usr/bin/env xdg-open
 # Plantilla de referencia para el menu de aplicaciones.
 # install.sh genera el .desktop real con la ruta absoluta en Exec.
+# Exec apunta al selector (auto GNOME/KDE); flags manuales: --gnome | --kde.
 [Desktop Entry]
 Type=Application
+Version=1.0
 Name=gifdesk gestor
-Comment=Gestiona tus GIF/WebP flotantes (galeria y editor)
+Comment=Gestiona tus GIF/WebP flotantes (elige sola la edicion GNOME o KDE)
 Exec=gifdesk-gui
 Icon=image-x-generic
 Terminal=false
+StartupNotify=true
 Categories=Utility;Graphics;
+Keywords=gif;webp;animacion;widget;

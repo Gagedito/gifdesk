@@ -1,0 +1,13 @@
+# Plantilla de referencia: edicion KDE/clasica (tkinter).
+# install.sh genera el .desktop real con la ruta absoluta en Exec.
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=gifdesk gestor (KDE)
+Comment=Gestiona tus GIF/WebP flotantes (edicion clasica tkinter)
+Exec=gifdesk-gui-kde
+Icon=image-x-generic
+Terminal=false
+StartupNotify=true
+Categories=Utility;Graphics;
+Keywords=gif;webp;animacion;widget;

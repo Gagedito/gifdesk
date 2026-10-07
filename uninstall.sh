@@ -4,6 +4,9 @@ set -euo pipefail
 
 BIN="$HOME/.local/bin/gifdesk"
 GUI_BIN="$HOME/.local/bin/gifdesk-gui"
+GUI_KDE_BIN="$HOME/.local/bin/gifdesk-gui-kde"
+GUI_GNOME_BIN="$HOME/.local/bin/gifdesk-gui-gnome"
+EXT_DIR="$HOME/.local/share/gnome-shell/extensions/gifdesk-widgets@gifdesk.local"
 BIN_DIR_PYCACHE="$HOME/.local/bin/__pycache__"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/gifdesk"
 DESKTOP="${XDG_CONFIG_HOME:-$HOME/.config}/autostart/gifdesk.desktop"
@@ -25,8 +28,11 @@ done
 if command -v systemctl >/dev/null 2>&1; then
     systemctl --user disable gifdesk.service 2>/dev/null || true
 fi
-rm -f "$BIN" "$GUI_BIN" "$DESKTOP" "$GUI_DESKTOP" "$UNIT"
-rm -rf "$CACHE" "$BIN_DIR_PYCACHE"
+if command -v gnome-extensions >/dev/null 2>&1 && [[ -d "$EXT_DIR" ]]; then
+    gnome-extensions disable "gifdesk-widgets@gifdesk.local" 2>/dev/null || true
+fi
+rm -f "$BIN" "$GUI_BIN" "$GUI_KDE_BIN" "$GUI_GNOME_BIN" "$DESKTOP" "$GUI_DESKTOP" "$UNIT"
+rm -rf "$EXT_DIR" "$CACHE" "$BIN_DIR_PYCACHE"
 if command -v systemctl >/dev/null 2>&1; then
     systemctl --user daemon-reload 2>/dev/null || true
 fi

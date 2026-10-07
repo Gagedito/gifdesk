@@ -16,6 +16,7 @@ SHARE_DIR="$HOME/.local/share/gifdesk"
 FILE_ARG=""
 WITH_HYPR="no"
 WITH_SYSTEMD="no"
+WITH_GNOME="no"
 YES="no"
 
 msg() { printf '%s\n' "$*"; }
@@ -28,6 +29,8 @@ Uso: ./install.sh [OPCIONES]
   --file RUTA       GIF/WebP que se mostrara al iniciar (defecto: ~/Descargas/rem.gif si existe)
   --with-hypr       Anade autostart a Hyprland (execs.lua) ademas de XDG autostart
   --with-systemd    Instala tambien la unidad de usuario systemd (opcional)
+  --with-gnome      Instala la GUI GNOME (GTK4/Adwaita) + extension de
+                    posicionamiento (en GNOME se hace solo)
   -y, --yes         No preguntar, asumir si
   -h, --help        Esta ayuda
 EOF
@@ -39,6 +42,7 @@ while [[ $# -gt 0 ]]; do
         --file=*) FILE_ARG="${1#*=}"; shift ;;
         --with-hypr) WITH_HYPR="yes"; shift ;;
         --with-systemd) WITH_SYSTEMD="yes"; shift ;;
+        --with-gnome) WITH_GNOME="yes"; shift ;;
         -y|--yes) YES="yes"; shift ;;
         -h|--help) usage; exit 0 ;;
         *) die "opcion desconocida: $1" ;;
@@ -61,6 +65,10 @@ if [[ -f /etc/os-release ]]; then
     esac
 fi
 msg "Distro detectada: familia '$FAM'."
+if [[ -f /etc/os-release ]] && grep -qi '^ID=nixos' /etc/os-release; then
+    msg "NixOS detectado: se recomienda el flake (ver README, seccion NixOS)."
+    msg "  nix profile install .#gifdesk   (o el modulo home-manager incluido)"
+fi
 
 install_deps() {
     if ! command -v mpv >/dev/null 2>&1; then
@@ -107,17 +115,62 @@ install_deps() {
     else
         msg "kdotool ya instalado."
     fi
-    # tkinter para la interfaz grafica (gifdesk-gui).
+    # tkinter para la interfaz clasica/KDE (gifdesk-gui-kde).
     if ! python3 -c "import tkinter" 2>/dev/null; then
-        msg "Instalando tkinter para la interfaz grafica..."
+        msg "Instalando tkinter para la interfaz clasica (KDE)..."
         case "$FAM" in
             arch)   sudo pacman -S --needed --noconfirm tk ;;
             debian) sudo apt-get install -y python3-tk ;;
             fedora) sudo dnf install -y python3-tkinter ;;
             suse)   sudo zypper install -y python3-tk ;;
             void)   sudo xbps-install -S python3-tkinter ;;
-            *)      msg "Aviso: no se pudo instalar tkinter; la GUI puede no abrir." ;;
+            *)      msg "Aviso: no se pudo instalar tkinter; la GUI KDE puede no abrir." ;;
         esac
+    fi
+}
+
+is_gnome_session() {
+    local de="${XDG_CURRENT_DESKTOP:-} ${DESKTOP_SESSION:-}"
+    de="$(printf '%s' "$de" | tr '[:upper:]' '[:lower:]')"
+    [[ "$de" == *gnome* ]]
+}
+
+install_gnome_deps() {
+    # GTK4 + libadwaita (>= 1.2) + PyGObject para gifdesk-gui-gnome.
+    if python3 -c "import gi; gi.require_version('Gtk','4.0'); gi.require_version('Adw','1'); from gi.repository import Adw; assert hasattr(Adw,'ToastOverlay')" 2>/dev/null; then
+        msg "GTK4/libadwaita ya disponibles."
+        return 0
+    fi
+    msg "Instalando GTK4 + libadwaita para la interfaz GNOME..."
+    case "$FAM" in
+        arch)   sudo pacman -S --needed --noconfirm gtk4 libadwaita python-gobject ;;
+        debian) sudo apt-get install -y python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 ;;
+        fedora) sudo dnf install -y gtk4 libadwaita python3-gobject ;;
+        suse)   sudo zypper install -y gtk4 libadwaita-1-0 python3-gobject ;;
+        void)   sudo xbps-install -S gtk4 libadwaita python3-gobject ;;
+        *)      msg "Aviso: instala manualmente GTK4 + libadwaita (>= 1.2) + PyGObject." ;;
+    esac
+}
+
+install_gnome_extension() {
+    # Motor GNOME (extension de actores Clutter): sin ella no hay
+    # posicion exacta, ni siempre-encima, ni ocultacion del dock.
+    local src="$SRC_DIR/extensions/gifdesk-widgets@gifdesk.local"
+    local dst="$HOME/.local/share/gnome-shell/extensions/gifdesk-widgets@gifdesk.local"
+    if [[ ! -d "$src" ]]; then
+        msg "Aviso: no se encontro la extension en $src; posicion aproximada."
+        return 0
+    fi
+    mkdir -p "$dst"
+    cp -f "$src/metadata.json" "$src/extension.js" "$dst/"
+    msg "Extension GNOME instalada: $dst"
+    if command -v gnome-extensions >/dev/null 2>&1; then
+        gnome-extensions enable "gifdesk-widgets@gifdesk.local" 2>/dev/null \
+            && msg "Extension habilitada." \
+            || msg "Aviso: no se pudo habilitar sola; activala en la app Extensiones."
+        msg "  En Wayland hace falta cerrar e iniciar sesion para que cargue."
+    else
+        msg "Activa la extension manualmente (app Extensiones) y reinicia sesion."
     fi
 }
 
@@ -156,7 +209,7 @@ case "$(printf '%s' "$GIF" | tr '[:upper:]' '[:lower:]')" in
     *) die "solo .gif / .webp: $GIF" ;;
 esac
 
-# ---------- 3. instalar binarios (visor + GUI) ----------
+# ---------- 3. instalar binarios (visor + GUIs) ----------
 LIB_DIR="$SHARE_DIR/library"
 INST_DIR="$CONFIG_DIR/instances"
 mkdir -p "$BIN_DIR" "$CONFIG_DIR" "$SHARE_DIR" "$LIB_DIR" "$INST_DIR" "${XDG_CACHE_HOME:-$HOME/.cache}/gifdesk"
@@ -164,16 +217,29 @@ cp -f "$SRC_DIR/gifdesk" "$BIN_DIR/gifdesk"
 chmod +x "$BIN_DIR/gifdesk"
 bash -n "$BIN_DIR/gifdesk"
 msg "Binario instalado: $BIN_DIR/gifdesk"
+# GUI: selector (auto GNOME/KDE) + las dos interfaces diferenciadas.
 cp -f "$SRC_DIR/gifdesk-gui" "$BIN_DIR/gifdesk-gui"
-chmod +x "$BIN_DIR/gifdesk-gui"
-python3 -m py_compile "$BIN_DIR/gifdesk-gui" 2>/dev/null \
-    || msg "Aviso: no se pudo precompilar la GUI (python3 ausente?); igual intentara abrirse."
+cp -f "$SRC_DIR/gifdesk-gui-kde" "$BIN_DIR/gifdesk-gui-kde"
+cp -f "$SRC_DIR/gifdesk-gui-gnome" "$BIN_DIR/gifdesk-gui-gnome"
+chmod +x "$BIN_DIR/gifdesk-gui" "$BIN_DIR/gifdesk-gui-kde" "$BIN_DIR/gifdesk-gui-gnome"
+bash -n "$BIN_DIR/gifdesk-gui"
+python3 -m py_compile "$BIN_DIR/gifdesk-gui-kde" "$BIN_DIR/gifdesk-gui-gnome" 2>/dev/null \
+    || msg "Aviso: no se pudo precompilar las GUIs (python3 ausente?); igual intentaran abrirse."
 # Atajos extra del GIF (opcional, archivo editable por el usuario).
 if [[ ! -f "$CONFIG_DIR/input.conf" ]]; then
     cp -f "$SRC_DIR/input.conf" "$CONFIG_DIR/input.conf"
     msg "Atajos instalados: $CONFIG_DIR/input.conf"
 fi
-msg "GUI instalada: $BIN_DIR/gifdesk-gui"
+msg "GUIs instaladas: $BIN_DIR/gifdesk-gui (selector) + -kde (tkinter) + -gnome (Adwaita)"
+
+if is_gnome_session; then
+    msg "Sesion GNOME detectada: instalando soporte GNOME."
+    WITH_GNOME="yes"
+fi
+if [[ "$WITH_GNOME" == "yes" ]]; then
+    install_gnome_deps
+    install_gnome_extension
+fi
 
 # Importar el GIF elegido a la libreria (la GUI gestiona esa carpeta).
 # Si ya existe identico, se reutiliza sin duplicar.
@@ -231,7 +297,7 @@ cat >"$APPS_DIR/gifdesk-gui.desktop" <<EOF
 Type=Application
 Version=1.0
 Name=gifdesk gestor
-Comment=Gestiona tus GIF/WebP flotantes (galeria y editor)
+Comment=Gestiona tus GIF/WebP flotantes (elige sola la edicion GNOME o KDE)
 Exec="$BIN_DIR/gifdesk-gui"
 Icon=image-x-generic
 Terminal=false
@@ -291,7 +357,9 @@ cat <<EOF
 
 Listo. Prueba ahora con:
   $BIN_DIR/gifdesk --file "$GIF"
-  $BIN_DIR/gifdesk-gui          # interfaz grafica: galeria + editor
+  $BIN_DIR/gifdesk-gui          # selector: edicion GNOME (Adwaita) o KDE (tkinter)
+  $BIN_DIR/gifdesk-gui --gnome  # forzar edicion GNOME
+  $BIN_DIR/gifdesk-gui --kde    # forzar edicion KDE/clasica
 
 Util:
   $BIN_DIR/gifdesk --stop     # detener

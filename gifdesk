@@ -5,7 +5,7 @@
 set -euo pipefail
 
 APP="gifdesk"
-VERSION="1.0.0"
+VERSION="1.1.0"
 SELF_BIN="$(readlink -f "${BASH_SOURCE[0]}")"
 # Politicas KWin (kwinrulesrc): 1 no afectar, 2 forzar, 3 aplicar al
 # inicio. Se usa APPLY (3, colocar al crear; verificado). El 4 (recordar)
@@ -79,7 +79,8 @@ Opciones:
   --pos GEOM         Posicion: X,Y | TL | TR | BL | BR | C (defecto: BR).
                        Mejor esfuerzo: en Wayland el compositor puede ignorarla
   --click-through    La ventana ignora el raton (clics pasan a traves)
-  --opacity PCT      Transparencia 0-100 (100 = opaco, regla KWin)
+  --opacity PCT      Transparencia 0-100 (100 = opaco).
+                       KDE: regla KWin. GNOME: opacidad real del actor
   --autostart        Sin --id: clasica + todas las instancias (autostart real).
                    Con --id: solo esa instancia segun su config
   --check            Valida el archivo y el entorno sin abrir ventana
@@ -88,12 +89,14 @@ Opciones:
   --stop-all         Detiene todas las instancias
   --status           Muestra si hay instancia corriendo (codigo 0/1)
   --list             Lista instancias y su estado
-  --where            Geometria real "TITULO X Y W H" (KDE + kdotool).
-                   Con --id, solo esa. Sin --id, todas las visibles
+  --where            Geometria real "TITULO X Y W H" (KDE: kdotool) o
+                       "ID X Y W H" (GNOME: geometria del actor via motor).
+                       Con --id, solo esa. Sin --id, todas las visibles
   --get CLAVE        Imprime FILE|MODE|SIZE|POS|LOCKED|OPACITY|REV de la instancia
   --lock             Bloquea (guarda + relanza si corre, vuelve a su sitio)
   --unlock           Desbloquea (guarda + relanza si corre)
   --rule-only        Sincroniza la regla KWin desde la config, sin lanzar
+                       (en GNOME reaplica la instancia visible; uso interno)
   -h, --help         Esta ayuda
   -v, --version      Version
 
@@ -206,6 +209,260 @@ is_kde_wayland() {
     [[ "$de" == *kde* || "$de" == *plasma* ]]
 }
 
+# ---------- motor GNOME (extension widgets, sin ventanas) ----------
+# En GNOME Wayland no hay ventanas mpv: la extension gifdesk dibuja cada
+# instancia como actor Clutter (sin dock/panel/alt-tab, siempre encima,
+# opacidad real). Todo pasa por D-Bus org.gifdesk.Widgets.
+
+GNOME_EXT_UUID="gifdesk-widgets@gifdesk.local"
+GNOME_BUS="org.gifdesk.Widgets"
+GNOME_OBJ="/org/gifdesk/Widgets"
+GNOME_IFACE="org.gifdesk.Widgets"
+GNOME_MAXF=300
+
+is_gnome() {
+    local de="${XDG_CURRENT_DESKTOP:-} ${DESKTOP_SESSION:-}"
+    de="$(printf '%s' "$de" | tr '[:upper:]' '[:lower:]')"
+    [[ "$de" == *gnome* ]]
+}
+
+is_gnome_wayland() {
+    is_gnome || return 1
+    if [[ "${XDG_SESSION_TYPE:-}" == "wayland" ]]; then
+        return 0
+    fi
+    [[ -n "${WAYLAND_DISPLAY:-}" ]]
+}
+
+gnome_eid() {
+    # Id del motor para la instancia actual ("main" = clasica).
+    if [[ -n "$IID" ]]; then printf '%s' "$IID"; else printf 'main'; fi
+}
+
+gnome_ext_enabled() {
+    # Extension instalada y habilitada (silencio si no hay gnome-extensions).
+    # Shell muestra State: ACTIVE (nuevo) o ENABLED (viejo).
+    have gnome-extensions || return 1
+    gnome-extensions show "$GNOME_EXT_UUID" 2>/dev/null | grep -qE 'State:[[:space:]]*(ENABLED|ACTIVE)'
+}
+
+gnome_call() {
+    # $1=metodo, resto=args para gdbus. Imprime la respuesta cruda.
+    have gdbus || return 1
+    local method="$1"; shift
+    local out
+    out="$(gdbus call --session --dest "$GNOME_BUS" --object-path "$GNOME_OBJ" \
+        --method "$GNOME_IFACE.$method" "$@" 2>/dev/null || true)"
+    [[ -n "$out" ]] || return 1
+    printf '%s' "$out"
+}
+
+gnome_unstr() {
+    # ('texto\n...',) -> texto con saltos reales. Falla si NONE/vacio.
+    local res="$1"
+    [[ "$res" == "('"* ]] || return 1
+    res="${res#\(\'}"
+    res="${res%\',)}"
+    res="${res//\\n/$'\n'}"
+    [[ -n "$res" && "$res" != "NONE" ]] || return 1
+    printf '%s\n' "$res"
+}
+
+gnome_engine_ok() {
+    # Motor respondiendo (extension activa). Silencioso.
+    [[ -n "$(gnome_call List 2>/dev/null)" ]]
+}
+
+gnome_engine_status() {
+    # Lineas para --check sobre el motor GNOME.
+    if gnome_ext_enabled; then
+        if gnome_engine_ok; then
+            printf 'check: gnome: motor activo (actores Clutter: sin dock ni alt-tab, siempre encima)\n'
+        else
+            printf 'check: gnome: extension habilitada pero el motor no responde (re-login?)\n'
+        fi
+    elif have gnome-extensions && gnome-extensions show "$GNOME_EXT_UUID" >/dev/null 2>&1; then
+        printf 'check: gnome: extension gifdesk instalada pero DESHABILITADA (activala y re-loguea)\n'
+    else
+        printf 'check: gnome: extension gifdesk no instalada (install.sh --with-gnome o el flake)\n'
+    fi
+}
+
+gnome_frames_dir() {
+    # $1=file $2=W $3=H (0 = nativo). Imprime el dir cache con f%03d.png
+    # al tamano final + durations.txt (ms separados por espacios).
+    # Clave por contenido+tamano: la 2a vez es instantaneo.
+    local f="$1" w="$2" h="$3"
+    have ffmpeg && have ffprobe \
+        || die "GNOME necesita ffmpeg+ffprobe (el motor pre-extrae los cuadros)"
+    [[ "$w" =~ ^[0-9]+$ && "$w" -gt 0 ]] || w=0
+    [[ "$h" =~ ^[0-9]+$ && "$h" -gt 0 ]] || h=0
+    if (( w == 0 || h == 0 )); then
+        local nat
+        nat="$(native_size "$f")"
+        w="${nat%x*}"; h="${nat#*x}"
+    fi
+    local key dir
+    key="$(sha1sum "$f" 2>/dev/null | cut -d' ' -f1 | head -c 16)"
+    [[ -n "$key" ]] || die "no se pudo leer $f"
+    dir="$CACHE_DIR/frames/${key}_${w}x${h}"
+    if [[ -f "$dir/durations.txt" ]] && compgen -G "$dir/f*.png" >/dev/null; then
+        printf '%s' "$dir"
+        return 0
+    fi
+    rm -rf "$dir"; mkdir -p "$dir"
+    ffmpeg -v error -y -i "$f" -frames:v "$GNOME_MAXF" \
+        -vf "scale=${w}:${h}" "$dir/f%03d.png" 2>/dev/null \
+        || die "ffmpeg no pudo extraer cuadros de $f"
+    local npng
+    npng="$(compgen -G "$dir/f*.png" | wc -l)"
+    (( npng > 0 )) || { rm -rf "$dir"; die "sin cuadros extraibles en $f"; }
+    # Duraciones por cuadro via ffprobe (s -> ms, 20..2000); respaldo 100.
+    local durs=() line ms n=0
+    while IFS= read -r line; do
+        ms="$(awk -v s="$line" 'BEGIN{ m=int(s*1000+0.5); if(m<20)m=20; if(m>2000)m=2000; print m }' 2>/dev/null || true)"
+        [[ "$ms" =~ ^[0-9]+$ ]] || ms=100
+        durs+=("$ms"); n=$((n+1))
+        (( n >= npng )) && break
+    done < <(ffprobe -v error -select_streams v:0 \
+        -show_entries frame=pkt_duration_time -of csv=p=0 "$f" 2>/dev/null || true)
+    local out=() i
+    for ((i = 0; i < npng; i++)); do
+        out+=("${durs[$i]:-100}")
+    done
+    printf '%s' "${out[*]}" >"$dir/durations.txt"
+    printf '%s' "$dir"
+}
+
+gnome_show_current() {
+    # Muestra la instancia actual en el motor con FILE/SIZE/POS/LOCKED/
+    # OPACITY (globales ya resueltas). CLICK_THROUGH fuerza bloqueo puntual.
+    local eid lock
+    eid="$(gnome_eid)"
+    local gw=0 gh=0
+    if [[ "$SIZE" =~ ^([0-9]+)x([0-9]+)$ ]]; then
+        gw="${BASH_REMATCH[1]}"; gh="${BASH_REMATCH[2]}"
+    fi
+    lock="false"
+    if [[ "$LOCKED" == "yes" || "$CLICK_THROUGH" == "yes" ]]; then lock="true"; fi
+    local op="$OPACITY"; [[ "$op" =~ ^[0-9]+$ ]] || op=100
+    local pos="$POS"; [[ -n "$pos" ]] || pos="BR"
+    # Espera breve al motor (en login la extension aun puede estar cargando).
+    local tries=0
+    while (( tries < 5 )) && ! gnome_engine_ok; do
+        sleep 1; tries=$((tries+1))
+    done
+    # Cuadros pre-extraidos (cache; la 1a vez de un GIF grande tarda segundos).
+    local fdir durs out
+    fdir="$(gnome_frames_dir "$FILE" "$gw" "$gh")"
+    durs="$(cat "$fdir/durations.txt" 2>/dev/null || true)"
+    [[ -n "$durs" ]] || die "cache de cuadros vacia ($fdir)"
+    # El motor exige W/H finales: van codificados en el nombre del cache.
+    geo="${fdir##*_}"; gw="${geo%x*}"; gh="${geo##*x}"
+    [[ "$gw" =~ ^[0-9]+$ && "$gh" =~ ^[0-9]+$ && "$gw" -gt 0 && "$gh" -gt 0 ]] \
+        || die "cache de cuadros invalida ($fdir)"
+    out="$(gnome_call Show "$eid" "$FILE" "$fdir" "$durs" "$pos" "$gw" "$gh" "$lock" "$op")" \
+        || die "motor GNOME no responde (extension inactiva?); activala, re-loguea y reintenta"
+    [[ "$out" == "(true,)"* ]] \
+        || die "el motor no pudo mostrar $FILE (cuadros ilegibles?)"
+    msg "gifdesk mostrando: $FILE (motor GNOME, id $eid)"
+}
+
+gnome_is_showing() {  # $1=id
+    local out
+    out="$(gnome_call IsShowing "$1")" || return 1
+    [[ "$out" == "(true,)"* ]]
+}
+
+gnome_cmd_stop() {
+    # Detiene la instancia actual en el motor.
+    local eid
+    eid="$(gnome_eid)"
+    if gnome_is_showing "$eid"; then
+        gnome_call Stop "$eid" >/dev/null 2>&1 || true
+        msg "gifdesk detenido (id $eid)."
+    else
+        msg "gifdesk no estaba en ejecucion."
+    fi
+}
+
+gnome_cmd_stop_all() {
+    if gnome_engine_ok; then
+        gnome_call StopAll >/dev/null 2>&1 || true
+    fi
+    msg "todas las instancias detenidas"
+}
+
+gnome_cmd_status() {
+    local eid
+    eid="$(gnome_eid)"
+    if gnome_is_showing "$eid"; then
+        msg "gifdesk en ejecucion (motor GNOME, id $eid)."
+    else
+        msg "gifdesk detenido."
+        return 1
+    fi
+}
+
+gnome_cmd_where() {
+    # Geometria real "ID X Y W H" del motor. Con --id solo esa; sin --id todas.
+    local want=""
+    [[ -n "$IID" ]] && want="$(gnome_eid)"
+    local out
+    out="$(gnome_call Geometry "$want")" \
+        || die "--where sin motor GNOME (extension inactiva?); coloca con el editor numerico"
+    gnome_unstr "$out" \
+        || die "no se ve instancia gifdesk en pantalla"
+}
+
+gnome_cmd_lock() {  # $1=yes|no
+    # Guarda LOCKED y lo aplica en vivo si se muestra (sin relanzar).
+    [[ -f "$CONFIG_FILE" ]] || die "sin instancia (muestra el GIF primero)"
+    MODE="widget"; FILE=""; SIZE=""; POS=""; LOCKED="no"; OPACITY="100"
+    load_config
+    if [[ "$LOCKED" != "$1" ]]; then
+        sed -i "s/^[[:space:]]*LOCKED=.*/LOCKED=$1/" "$CONFIG_FILE"
+        grep -qE '^[[:space:]]*LOCKED=' "$CONFIG_FILE" \
+            || echo "LOCKED=$1" >>"$CONFIG_FILE"
+        LOCKED="$1"
+    fi
+    local eid lock
+    eid="$(gnome_eid)"
+    if gnome_is_showing "$eid"; then
+        lock="false"; [[ "$LOCKED" == "yes" ]] && lock="true"
+        gnome_call SetLocked "$eid" "$lock" >/dev/null 2>&1 \
+            || die "no se pudo aplicar el bloqueo (motor no responde)"
+        if [[ "$LOCKED" == "yes" ]]; then
+            msg "bloqueado (ignora el raton)."
+        else
+            msg "desbloqueado (se puede mover)."
+        fi
+    else
+        msg "guardado (se aplicara al mostrar)"
+    fi
+}
+
+gnome_cmd_ruleonly() {
+    # Reaplica la instancia visible con su config (equivale a Aplicar).
+    MODE="widget"; FILE=""; SIZE=""; POS=""; LOCKED="no"; OPACITY="100"
+    load_config
+    [[ -z "$FILE" || ! -f "$FILE" ]] && die "sin archivo para regla"
+    local eid
+    eid="$(gnome_eid)"
+    if gnome_is_showing "$eid"; then
+        gnome_show_current
+    else
+        msg "guardado (se aplicara al mostrar)"
+    fi
+}
+
+gnome_dry_run() {
+    # Plan del actor sin mostrar nada.
+    local size="${SIZE:-nativo}" pos="${POS:-BR}"
+    printf 'actor id=%s file=%s size=%s pos=%s locked=%s opacity=%s (motor GNOME, sin ventana)\n' \
+        "$(gnome_eid)" "$FILE" "$size" "$pos" "$LOCKED" "$OPACITY"
+}
+
 kwin_screen() {
     # "1366x768" de la salida de supportInformation. Vacio si falla.
     have qdbus6 || return 1
@@ -299,18 +556,21 @@ bump_rev() {
 sync_placement() {
     # $1=pos $2=size(WxH) $3=opacidad. En KDE Wayland escribe la regla
     # (solo si la REV cambio = orden explicita); resto: nada.
-    is_kde_wayland || return 0
-    local scr gw gh op
-    scr="$(kwin_screen)" || return 0
-    [[ -n "$scr" ]] || return 0
-    gw="${2%x*}"; gh="${2#*x}"
-    [[ "$gw" =~ ^[0-9]+$ && "$gh" =~ ^[0-9]+$ ]] || return 0
-    op="$3"; [[ "$op" =~ ^[0-9]+$ ]] || op=100
-    (( op < 0 )) && op=0; (( op > 100 )) && op=100
-    local xy rev
-    xy="$(kwin_abspos "$1" "$gw" "$gh" "${scr%x*}" "${scr#*x}")"
-    rev="$(conf_rev "$CONFIG_FILE")"
-    ensure_kwin_rule "${xy%,*}" "${xy#*,}" "$gw" "$gh" "$rev" "$op"
+    # (En GNOME no hay ventanas ni reglas: el motor coloca el actor.)
+    if is_kde_wayland; then
+        local scr gw gh op
+        scr="$(kwin_screen)" || return 0
+        [[ -n "$scr" ]] || return 0
+        gw="${2%x*}"; gh="${2#*x}"
+        [[ "$gw" =~ ^[0-9]+$ && "$gh" =~ ^[0-9]+$ ]] || return 0
+        op="$3"; [[ "$op" =~ ^[0-9]+$ ]] || op=100
+        (( op < 0 )) && op=0; (( op > 100 )) && op=100
+        local xy rev
+        xy="$(kwin_abspos "$1" "$gw" "$gh" "${scr%x*}" "${scr#*x}")"
+        rev="$(conf_rev "$CONFIG_FILE")"
+        ensure_kwin_rule "${xy%,*}" "${xy#*,}" "$gw" "$gh" "$rev" "$op"
+        return 0
+    fi
 }
 
 running_pid() {    if [[ -f "$PIDFILE" ]]; then
@@ -379,6 +639,12 @@ run_autostart() {
     MODE="widget"; FILE=""; SIZE=""; POS=""; LOCKED="no"; OPACITY="100"
     load_config
     [[ -z "$FILE" ]] && die "autostart sin FILE ($CONFIG_FILE)"
+    if is_gnome_wayland; then
+        # En GNOME el motor es la extension (actores, no ventanas mpv).
+        [[ "$MODE" == "wallpaper" ]] && die "--mode wallpaper no soportado en GNOME (usa widget)"
+        gnome_show_current
+        return $?
+    fi
     [[ "$MODE" =~ ^(widget|wallpaper)$ ]] || die "MODE invalido en $CONFIG_FILE"
     launch "$FILE" "$MODE" "$SIZE" "$POS" "no"
 }
@@ -399,6 +665,7 @@ autostart_all() {
 
 cmd_where() {
     # Geometria REAL via kdotool (KDE): "TITULO X Y W H" por linea.
+    # (En GNOME se resuelve en main() via el motor; aqui solo KDE/X11.)
     # Con --id solo esa instancia; sin --id, todas las visibles.
     have kdotool || die "--where necesita kdotool (sudo pacman -S kdotool)"
     local u name geo x y w h found="no" line
@@ -475,7 +742,9 @@ cmd_check() {
                 -of default=noprint_wrappers=1 "$f" 2>&1 || rc=1
         fi
     fi
-    if have mpv; then
+    if is_gnome_wayland; then
+        printf 'check: motor: extension (mpv no necesario: renderizan los actores Clutter)\n'
+    elif have mpv; then
         printf 'check: mpv OK: %s\n' "$(mpv --version 2>/dev/null | head -n1)"
     else
         printf 'check: falta mpv en el PATH\n' >&2; rc=1
@@ -485,6 +754,14 @@ cmd_check() {
         printf 'check: compositor: detectado (transparencia disponible)\n'
     else
         printf 'check: compositor: NO detectado (la transparencia puede verse negra)\n' >&2
+    fi
+    if is_kde_wayland; then
+        printf 'check: backend: KDE Wayland (regla KWin: posicion/tamano/opacidad)\n'
+    elif is_gnome_wayland; then
+        printf 'check: backend: GNOME (actores Clutter via extension: sin dock ni alt-tab)\n'
+        gnome_engine_status
+    else
+        printf 'check: backend: generico (%s; posicion best-effort)\n' "$(detect_session)"
     fi
     return "$rc"
 }
@@ -775,11 +1052,11 @@ main() {
     select_instance
 
     case "$action" in
-        stop)    cmd_stop; exit 0 ;;
-        status)  cmd_status; exit $? ;;
+        stop)    if is_gnome_wayland; then gnome_cmd_stop; else cmd_stop; fi; exit 0 ;;
+        status)  if is_gnome_wayland; then gnome_cmd_status; else cmd_status; fi; exit $? ;;
         list)    list_instances; exit 0 ;;
-        stopall) cmd_stop_all; exit 0 ;;
-        where)   cmd_where; exit $? ;;
+        stopall) if is_gnome_wayland; then gnome_cmd_stop_all; else cmd_stop_all; fi; exit 0 ;;
+        where)   if is_gnome_wayland; then gnome_cmd_where; else cmd_where; fi; exit $? ;;
         get)
             case "$getkey" in
                 FILE|MODE|SIZE|POS|LOCKED|OPACITY|REV) ;;
@@ -798,6 +1075,9 @@ main() {
             esac
             exit 0 ;;
         setlock)
+            if is_gnome_wayland; then
+                gnome_cmd_lock "$newlock"; exit 0
+            fi
             [[ -f "$CONFIG_FILE" ]] || die "sin instancia (muestra el GIF primero)"
             MODE="widget"; FILE=""; SIZE=""; POS=""; LOCKED="no"; OPACITY="100"
             load_config
@@ -813,6 +1093,9 @@ main() {
             msg "guardado (se aplicara al mostrar)"
             exit 0 ;;
         ruleonly)
+            if is_gnome_wayland; then
+                gnome_cmd_ruleonly; exit 0
+            fi
             MODE="widget"; FILE=""; SIZE=""; POS=""; LOCKED="no"; OPACITY="100"
             load_config
             [[ -z "$FILE" || ! -f "$FILE" ]] && die "sin archivo para regla"
@@ -837,7 +1120,12 @@ main() {
     [[ -z "$FILE" ]] && { usage >&2; die "falta --file (ej: gifdesk --file ~/Descargas/rem.gif)"; }
     [[ -f "$FILE" ]] || die "no existe: $FILE"
     is_supported "$FILE" || die "solo .gif / .webp: $FILE"
-    have mpv || die "falta mpv (instala con install.sh)"
+    if is_gnome_wayland; then
+        # En GNOME renderiza la extension (actores, no mpv ni ventanas).
+        [[ "$MODE" == "wallpaper" ]] && die "--mode wallpaper no soportado en GNOME (usa widget)"
+    else
+        have mpv || die "falta mpv (instala con install.sh)"
+    fi
 
     if [[ "$save" == "yes" ]]; then
         mkdir -p "$(dirname "$CONFIG_FILE")"
@@ -857,6 +1145,15 @@ main() {
     if [[ "$do_check" == "yes" ]]; then
         cmd_check "$FILE"
         exit $?
+    fi
+
+    if is_gnome_wayland; then
+        if [[ "$dry" == "yes" ]]; then
+            gnome_dry_run
+            exit 0
+        fi
+        gnome_show_current
+        exit 0
     fi
 
     launch "$FILE" "$MODE" "$SIZE" "$POS" "$dry"
