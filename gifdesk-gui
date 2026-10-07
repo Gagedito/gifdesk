@@ -620,6 +620,13 @@ def main():
         refresh_list()
         set_status(f"Borrado: {p.name} (instancia {iid} eliminada)")
 
+    def busy_btns(disabled):
+        for b in (mshow_btn, start_btn, stop_btn):
+            try:
+                b.config(state="disabled" if disabled else "normal")
+            except tk.TclError:
+                pass
+
     def do_show():
         p = selected_path()
         if p is None:
@@ -633,6 +640,7 @@ def main():
         refresh_current()
         refresh_list(select=p.name)
         set_status("Mostrando... (sin bloquear la ventana)")
+        busy_btns(True)
 
         def done(res):
             rc, out = res
@@ -640,14 +648,17 @@ def main():
                 messagebox.showerror("gifdesk", f"No se pudo mostrar:\n{out}")
             refresh_list(select=p.name)
             refresh_status_line()
+            busy_btns(False)
 
         in_thread(done, run_inst, iid, "--autostart")
 
     btns = tk.Frame(left)
     btns.pack(fill="x", pady=4)
-    tk.Button(btns, text="Anadir", command=do_add).pack(side="left", expand=True, fill="x")
+    show_btn = tk.Button(btns, text="Anadir", command=do_add)
+    show_btn.pack(side="left", expand=True, fill="x")
     tk.Button(btns, text="Borrar", command=do_delete).pack(side="left", expand=True, fill="x")
-    tk.Button(btns, text="Mostrar", command=do_show).pack(side="left", expand=True, fill="x")
+    mshow_btn = tk.Button(btns, text="Mostrar", command=do_show)
+    mshow_btn.pack(side="left", expand=True, fill="x")
     lib_list.bind("<<ListboxSelect>>", on_select)
     lib_list.bind("<Double-Button-1>", lambda _e: do_show())
 
@@ -1003,29 +1014,35 @@ def main():
             return
         adopt_legacy(cfg["FILE"])
         write_config(cfg, inst_conf(iid))
-        set_status("Iniciando...")
+        set_status("Iniciando... (sin bloquear la ventana)")
+        busy_btns(True)
 
         def done(res):
             refresh_list()
             refresh_status_line()
+            busy_btns(False)
 
         in_thread(done, run_inst, iid, "--autostart")
 
     def do_stop():
         iid = cur_id()
         set_status("Deteniendo...")
+        busy_btns(True)
 
         def done(_res):
             refresh_list()
             refresh_status_line()
+            busy_btns(False)
 
         if iid is None:
             done((0, ""))
         else:
             in_thread(done, run_inst, iid, "--stop")
 
-    tk.Button(ctl, text="Iniciar", command=do_start).pack(side="left")
-    tk.Button(ctl, text="Detener", command=do_stop).pack(side="left")
+    start_btn = tk.Button(ctl, text="Iniciar", command=do_start)
+    start_btn.pack(side="left")
+    stop_btn = tk.Button(ctl, text="Detener", command=do_stop)
+    stop_btn.pack(side="left")
 
     tk.Label(right, textvariable=status_var, wraplength=280,
              justify="left").pack(anchor="w", pady=(10, 0))

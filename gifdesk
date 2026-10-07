@@ -420,19 +420,31 @@ cmd_where() {
 }
 
 cmd_stop() {
-    local pid
+    # Detiene TODOS los mpv de esta instancia (pidfile + barrido por
+    # titulo, para no dejar huerfanos de carreras pasadas).
+    with_instance_lock
+    local pids pid p
+    pids="$(pgrep -f -- "--title=${TITLE}( |$)" 2>/dev/null || true)"
     if pid="$(running_pid)"; then
-        kill "$pid" 2>/dev/null || true
-        sleep 0.5
-        if kill -0 "$pid" 2>/dev/null; then
-            kill -9 "$pid" 2>/dev/null || true
-        fi
-        rm -f "$PIDFILE" "$SOCKET"
-        msg "gifdesk detenido (pid $pid)."
-    else
+        pids="$(printf '%s\n%s' "$pid" "$pids")"
+    fi
+    pids="$(printf '%s\n' "$pids" | grep -E '^[0-9]+$' | sort -u || true)"
+    if [[ -z "$pids" ]]; then
         rm -f "$PIDFILE" "$SOCKET"
         msg "gifdesk no estaba en ejecucion."
+        return 0
     fi
+    for p in $pids; do
+        kill "$p" 2>/dev/null || true
+    done
+    sleep 0.5
+    for p in $pids; do
+        if kill -0 "$p" 2>/dev/null; then
+            kill -9 "$p" 2>/dev/null || true
+        fi
+    done
+    rm -f "$PIDFILE" "$SOCKET"
+    msg "gifdesk detenido."
 }
 
 cmd_stop_all() {
@@ -604,8 +616,20 @@ preflight_mpv_args() {
     printf '%s\0' "${pargs[@]}"
 }
 
+with_instance_lock() {
+    # Exclusion mutua por instancia (evita lanzamientos solapados por doble
+    # clic: uno mataba al otro = parpadeo; o dejaba huerfanos duplicados).
+    # Bloquea hasta 15 s y sigue; el FD se libera al salir el proceso.
+    local lockf="$CACHE_DIR/$TITLE.lock"
+    exec {GIFDESK_LOCK_FD}>"$lockf" 2>/dev/null || return 0
+    if have flock; then
+        flock -w 15 "$GIFDESK_LOCK_FD" 2>/dev/null || true
+    fi
+}
+
 launch() {
     local f="$1" mode="$2" size="$3" pos="$4" dry="$5"
+    with_instance_lock
     local -a args=()
     while IFS= read -r -d '' tok; do
         args+=("$tok")
