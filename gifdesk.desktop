@@ -1,3 +1,4 @@
+#!/usr/bin/env xdg-open
 # Plantilla de referencia. install.sh genera el .desktop real con la ruta
 # absoluta en Exec (aqui se usa el nombre, que resuelve por PATH cuando
 # ~/.local/bin esta en el PATH).
