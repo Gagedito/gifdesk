@@ -82,20 +82,74 @@ nix run .#gifdesk -- --check --file ~/anim.gif   # probar sin instalar
 nix profile install .#gifdesk                     # instalar en tu perfil
 ```
 
-Con home-manager en tu flake:
+Con home-manager en tu flake (este bloque completo, tal cual, con solo tres
+datos por cambiar: `tu-usuario`, `x86_64-linux` y `home.stateVersion`):
 
 ```nix
-inputs.gifdesk.url = "path:/home/sabrina/Projects/gifdesk";  # o github:...
-
-home-manager.users.sabrina = {
-  imports = [ inputs.gifdesk.homeManagerModules.gifdesk ];
-  programs.gifdesk = {
-    enable = true;
-    package = inputs.gifdesk.packages.${pkgs.system}.gifdesk;
-    gnomeExtension = true;
+{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    gifdesk.url = "github:Gagedito/gifdesk";     # este repo
+    home-manager.url = "github:nix-community/home-manager";
+    home-manager.inputs.nixpkgs.follows = "nixpkgs";   # una sola copia de nixpkgs
   };
-};
+
+  outputs = { nixpkgs, gifdesk, home-manager, ... }:
+    let
+      system = "x86_64-linux";              # o "aarch64-linux"
+      pkgs = nixpkgs.legacyPackages.${system};
+    in {
+      homeConfigurations."tu-usuario" = home-manager.lib.homeManagerConfiguration {
+        inherit pkgs;                     # OJO: sin `system` aqui, home-manager no lo admite
+        modules = [
+          gifdesk.homeManagerModules.gifdesk
+          {
+            # Requisitos de home-manager, no de gifdesk:
+            home.username = "tu-usuario";
+            home.homeDirectory = "/home/tu-usuario";
+            home.stateVersion = "24.11";
+
+            programs.gifdesk = {
+              enable = true;
+              package = gifdesk.packages.${system}.gifdesk;
+              gnomeExtension = true;       # enlaza el motor del shell
+            };
+          }
+        ];
+      };
+    };
+}
 ```
+
+Activar con `home-manager switch --configuration tu-usuario`.
+
+Tres datos que hay que cambiar por los tuyos: `tu-usuario`, `x86_64-linux`
+(`aarch64-linux` en Raspberry Pi y en Apple Silicon) y `home.stateVersion`
+(el de tu home-manager actual).
+
+Para seguir una version que aun no esta publicada, cambia solo la URL del
+input por la que te interese:
+
+| Quieres | `gifdesk.url` |
+|---------|---------------|
+| La versión publicada | `github:Gagedito/gifdesk` |
+| Una rama concreta | `github:Gagedito/gifdesk/nombre-de-la-rama` |
+| Tu propia copia en disco | `path:./gifdesk` |
+
+El comando para probarlo sin instalar nada:
+
+```bash
+nix run github:Gagedito/gifdesk#gifdesk -- --check --file ~/anim.gif
+```
+
+Si quieres la configuración en `home.nix` en vez de dentro del flake, pásale
+el paquete con `_module.args`: añade
+
+```nix
+          ({ ... }: { _module.args.gifdeskPackage = gifdesk.packages.${system}.gifdesk; })
+```
+
+a la lista `modules`, y en `home.nix` usa `package = gifdeskPackage;`.
 
 Tras activar la extensión (`gnome-extensions enable gifdesk-widgets@gifdesk.local`)
 cierra e inicia sesión (Wayland) y confirma con `gifdesk --check`.
