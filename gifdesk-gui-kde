@@ -192,19 +192,35 @@ def send_ipc_sock(sockname, *args):
 
 
 def live_speed(iid, speed):
-    """Aplica la velocidad al mpv en vivo por su socket IPC (sin relanzar,
-    asi que el GIF no vuelve a su sitio). True si mpv la acepto."""
-    if speed <= 0:
+    """Pone la velocidad al mpv en vivo por su socket IPC (sin relanzar, asi
+    que el GIF no vuelve a su sitio). True si mpv acepto el valor.
+
+    Se comprueba con get_property: mpv responde "success" a casi todo, asi
+    que un OK sin verificar dejaria el slider mintiendo sobre la pantalla.
+    """
+    if speed is None or speed <= 0:
         return False
-    r = send_ipc_sock(f"socket-{iid}", "set_property", "speed", speed)
-    return r.get("error") == "success"
+    sock = f"socket-{iid}"
+    r = send_ipc_sock(sock, "set_property", "speed", speed)
+    if r.get("error") != "success":
+        return False
+    g = send_ipc_sock(sock, "get_property", "speed")
+    try:
+        return abs(float(g.get("data")) - speed) < 0.01
+    except (TypeError, ValueError):
+        return False
 
 
 def native_speed(path, fps):
-    """fps objetivo -> multiplicador de mpv, leyendo los fps nativos con
-    ffprobe (vacio si no se puede: el nucleo lo omite y va a ritmo original)."""
+    """fps objetivo -> multiplicador de mpv.
+
+    fps=0 significa "ritmo original": es 1.0, que SI se puede poner en vivo
+    (recuperar el ritmo sin relanzar y sin que el GIF salte de sitio).
+    Para fps>0 hace falta el ritmo nativo del archivo: si ffprobe no lo dice,
+    devuelve None y quien llama relanza (no adivina el multiplicador).
+    """
     if not fps or fps <= 0:
-        return None
+        return 1.0
     try:
         import subprocess as _sp
         p = _sp.run(
@@ -871,10 +887,38 @@ def main():
     tk.Scale(right, from_=0, to=100, orient="horizontal", length=220,
              variable=opa_var).pack(anchor="w")
 
-    tk.Label(right, text="Velocidad (fps): 0 = original, 1-60 = fijos").pack(anchor="w")
+    # Velocidad: cada GIF con su ritmo. 0 = original, 1-60 = cuadros/s fijos.
+    # Los handlers van ANTES del widget: `command=` se evalua al construir y
+    # python aun no tiene la variable si la define despues.
     fps_var = tk.IntVar(value=0)
+    fps_hint = tk.StringVar(value="original")
+
+    def on_fps(_v=None):
+        """El slider marca la velocidad deseada. No se aplica solo: se guarda
+        al pulsar Aplicar cambios (asi no relanza en cada pixel del slider)."""
+        n = int(fps_var.get())
+        fps_hint.set("original" if n == 0 else f"{n} fps")
+
+    tk.Label(right, text="Velocidad (fps): 0 = original, 1-60 = fijos").pack(anchor="w")
     tk.Scale(right, from_=0, to=60, orient="horizontal", length=220,
-             variable=fps_var).pack(anchor="w")
+             variable=fps_var, command=on_fps).pack(anchor="w")
+    tk.Label(right, textvariable=fps_hint).pack(anchor="w")
+
+    def do_fps_original():
+        """Vuelve al ritmo del archivo (1.0x) sin relanzar ni moverlo."""
+        iid = cur_id()
+        if iid is None:
+            set_status("Selecciona un GIF de la galeria")
+            return
+        fps_var.set(0)
+        cfg["FPS"] = "0"
+        write_config(cfg, inst_conf(iid))
+        bump_rev(inst_conf(iid))
+        if not is_running_inst(iid):
+            set_status("Velocidad: original (se aplicara al mostrar)")
+            return
+        set_status("Velocidad: original...")
+        in_thread(_fps_live_done, _fps_live, iid, 0)
 
     tk.Label(right, text="Posicion:").pack(anchor="w", pady=(8, 0))
     pos_var = tk.StringVar(value=cfg["POS"] if cfg["POS"] in PRESETS[:5] else "Personalizada...")
@@ -911,6 +955,7 @@ def main():
             opa_var.set(int(cfg.get("OPACITY", "100")))
         except (TypeError, ValueError):
             opa_var.set(100)
+        # El slider de velocidad refleja lo guardado (no siempre 0).
         try:
             fps_var.set(max(0, min(60, int(cfg.get("FPS", "0") or 0))))
         except (TypeError, ValueError):
@@ -925,9 +970,10 @@ def main():
                 x_var.set(x.strip()); y_var.set(y.strip())
 
     def _fps_live(iid, fps):
-        """Velocidad en vivo; si mpv no la acepta, relanza (no queda a medias)."""
+        """Velocidad en vivo por IPC. Si mpv no la acepta, relanza: el GIF se
+        queda a la velocidad pedida aunque pierda el sitio (nunca a medias)."""
         sp = native_speed(cfg.get("FILE", ""), fps)
-        if sp and live_speed(iid, sp):
+        if live_speed(iid, sp):
             return ("live", None)
         run_inst(iid, "--autostart")
         return ("relaunch", None)
@@ -935,8 +981,11 @@ def main():
     def _fps_live_done(res):
         kind, _out = res
         fps = int(cfg.get("FPS", "0") or 0)
-        set_status(f"Velocidad: {fps} fps"
-                   + ("" if kind == "live" else " (relanzado)"))
+        if kind == "live":
+            set_status(f"Velocidad: {fps} fps (en vivo)"
+                       if fps else "Velocidad: original (en vivo)")
+        else:
+            set_status(f"Velocidad: {fps} fps (relanzado, sin IPC)")
         sync_editor_from_config()
         refresh_status_line()
 
@@ -1146,6 +1195,8 @@ def main():
 
     lock_btn.config(command=do_lock_toggle)
     lock_btn.pack(anchor="w")
+    tk.Button(right, text="Velocidad original (1.0x)",
+              command=do_fps_original).pack(anchor="w", pady=(2, 0))
     tk.Button(right, text="Fijar posicion actual",
               command=do_fix_position).pack(anchor="w")
     tk.Label(right, text="Sobre el GIF: arrastra para mover.\nTamano con el % del editor.",
