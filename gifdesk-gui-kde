@@ -372,6 +372,40 @@ def main():
     def cur_id():
         return cur["id"]
 
+    warned = {"ipc": False, "core": False}
+    MIN_CORE = (2, 0)
+
+    def log_gui(msg):
+        try:
+            logp = Path(os.environ.get("XDG_CACHE_HOME",
+                                       os.path.join(str(Path.home()), ".cache")))
+            logp = logp / "gifdesk" / "gui.log"
+            logp.parent.mkdir(parents=True, exist_ok=True)
+            with open(logp, "a") as f:
+                f.write(msg.rstrip() + "\n")
+        except Exception:
+            pass
+
+    def core_version():
+        """(mayor, menor) del binario instalado, o None si no se sabe."""
+        try:
+            rc, out = run_gifdesk("--version")
+            if rc != 0:
+                return None
+            m = re.search(r"(\d+)\.(\d+)", out)
+            return (int(m.group(1)), int(m.group(2))) if m else None
+        except Exception:
+            return None
+
+    def check_core_version():
+        v = core_version()
+        if v is None or v < MIN_CORE:
+            shown = f"{v[0]}.{v[1]}" if v else "desconocida"
+            set_status(f"Aviso: nucleo gifdesk {shown} viejo: reinstala "
+                       f"(./install.sh) para bloqueo en vivo y opacidad")
+            log_gui(f"nucleo viejo o ilegible ({shown}); se necesita >= "
+                    f"{MIN_CORE[0]}.{MIN_CORE[1]} para IPC en vivo")
+
     root = tk.Tk()
     root.title("gifdesk — gestor")
     root.geometry("880x640")
@@ -976,7 +1010,17 @@ def main():
                 verb = "Bloqueado" if lock else "Desbloqueado"
                 set_status(f"{verb} {iid} donde esta (en vivo)")
             else:
-                set_status("Sin respuesta en vivo, relanzando...")
+                # Sin IPC (nucleo viejo sin socket?): relanzar avisando una vez.
+                log_gui(f"bloqueo {iid}: sin IPC en vivo, relanzo (nucleo viejo?)")
+                set_status("Sin IPC en vivo: relanzo (reinstala ./install.sh si se repite)...")
+                if not warned["ipc"]:
+                    warned["ipc"] = True
+                    messagebox.showwarning(
+                        "gifdesk",
+                        "Sin control en vivo (falta el socket IPC del nucleo).\n"
+                        "Se relanza en su lugar.\n\n"
+                        "Si se repite: reinstala con ./install.sh para actualizar "
+                        "el binario gifdesk.")
 
                 def done2(res2):
                     rc, out = res2
@@ -1053,6 +1097,7 @@ def main():
     sync_editor_from_config()
     refresh_lock()
     refresh_status_line()
+    check_core_version()
     root.report_callback_exception = _log_err
     root.mainloop()
 

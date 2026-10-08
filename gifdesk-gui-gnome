@@ -42,6 +42,33 @@ EXT_UUID = "gifdesk-widgets@gifdesk.local"
 SUPPORTED = (".gif", ".webp")
 PRESETS = ["BR", "BL", "TR", "TL", "C", "Personalizada…"]
 
+MIN_CORE = (2, 0)
+
+
+def gui_log(msg):
+    try:
+        base = Path(os.environ.get("XDG_CACHE_HOME",
+                                   os.path.join(str(Path.home()), ".cache")))
+        logp = base / "gifdesk" / "gui.log"
+        logp.parent.mkdir(parents=True, exist_ok=True)
+        with open(logp, "a") as f:
+            f.write(str(msg).rstrip() + "\n")
+    except Exception:
+        pass
+
+
+def core_version():
+    """(mayor, menor) del binario instalado, o None si no se sabe."""
+    try:
+        p = subprocess.run([BIN, "--version"], capture_output=True,
+                           text=True, timeout=10)
+        if p.returncode != 0:
+            return None
+        m = re.search(r"(\d+)\.(\d+)", p.stdout + p.stderr)
+        return (int(m.group(1)), int(m.group(2))) if m else None
+    except Exception:
+        return None
+
 
 # ---------- lógica de instancias (igual modelo que la GUI KDE) ----------
 
@@ -548,6 +575,7 @@ class GestorApp(Adw.Application):
 
         win.present()
         self.refresh_banner()
+        self.check_core_version()
         self.refresh_list()
 
     # ---------- utilidades UI ----------
@@ -567,6 +595,14 @@ class GestorApp(Adw.Application):
                 return False
             GLib.idle_add(idle)
         threading.Thread(target=run, daemon=True).start()
+
+    def check_core_version(self):
+        v = core_version()
+        if v is None or v < MIN_CORE:
+            shown = f"{v[0]}.{v[1]}" if v else "desconocida"
+            self.toast(f"Nucleo gifdesk {shown} viejo: reinstala para funciones en vivo")
+            gui_log(f"nucleo viejo o ilegible ({shown}); se necesita >= "
+                    f"{MIN_CORE[0]}.{MIN_CORE[1]} para motor/IPC en vivo")
 
     def refresh_banner(self):
         st = ext_state()
@@ -926,7 +962,8 @@ class GestorApp(Adw.Application):
                 self.refresh_status()
                 self.sync_editor()
             else:
-                self.toast("Sin respuesta en vivo, relanzando…")
+                gui_log(f"bloqueo {iid}: sin motor en vivo, relanzo (nucleo/extension viejos?)")
+                self.toast("Sin motor en vivo: relanzo (reinstala ./install.sh si se repite)")
 
                 def done2(res2):
                     rc, out = res2

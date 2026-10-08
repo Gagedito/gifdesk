@@ -5,7 +5,7 @@
 set -euo pipefail
 
 APP="gifdesk"
-VERSION="1.1.0"
+VERSION="2.0"
 SELF_BIN="$(readlink -f "${BASH_SOURCE[0]}")"
 # Politicas KWin (kwinrulesrc): 1 no afectar, 2 forzar, 3 aplicar al
 # inicio. Se usa APPLY (3, colocar al crear; verificado). El 4 (recordar)
