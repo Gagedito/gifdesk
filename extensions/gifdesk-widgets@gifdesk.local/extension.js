@@ -8,9 +8,9 @@
 // solo los carga (PNG estáticos: fiable con cualquier formato) y anima.
 //
 // D-Bus: org.gifdesk.Widgets en /org/gifdesk/Widgets
-//   Show(id, file, framesDir, durs, pos, w, h, locked, opacity) -> bool
+//   Show(id, file, framesDir, durs, pos, w, h, locked, opacity, fps) -> bool
 //     durs: "ms ms ..." por cuadro — pos: BR|BL|TR|TL|C|"X,Y"
-//     w/h 0 = nativo del PNG
+//     w/h 0 = nativo del PNG. fps > 0 = fuerza N cuadros/s (0 = original)
 //   Stop(id) -> bool | StopAll() -> bool
 //   IsShowing(id) -> bool | List() -> ids o "NONE"
 //   Geometry(id|"") -> "ID X Y W H" por línea, o "NONE"
@@ -38,6 +38,7 @@ const IFACE = `
       <arg type="i" name="h" direction="in"/>
       <arg type="b" name="locked" direction="in"/>
       <arg type="i" name="opacity" direction="in"/>
+      <arg type="i" name="fps" direction="in"/>
       <arg type="b" name="ok" direction="out"/>
     </method>
     <method name="Stop">
@@ -63,11 +64,33 @@ const IFACE = `
       <arg type="b" name="lock" direction="in"/>
       <arg type="b" name="ok" direction="out"/>
     </method>
+    <method name="SetFps">
+      <arg type="s" name="id" direction="in"/>
+      <arg type="i" name="fps" direction="in"/>
+      <arg type="b" name="ok" direction="out"/>
+    </method>
   </interface>
 </node>`;
 
 const MARGIN = 16;
 const MAX_FRAMES = 300;
+const FPS_MIN = 1;
+const FPS_MAX = 60;
+
+// 0 = ritmo original del archivo. Fuera de 1-60 se trata como 0.
+function clampFps(fps) {
+    const n = parseInt(fps, 10) || 0;
+    return n >= FPS_MIN ? Math.min(FPS_MAX, n) : 0;
+}
+
+// Duración por cuadro: fps>0 fuerza 1000/fps ms (clamp 20-2000); si no, la
+// original que trae durations.txt. Así el cache nunca se toca al cambiar fps.
+function frameDurs(base, fps) {
+    if (!fps)
+        return base;
+    const d = Math.max(20, Math.min(2000, Math.round(1000 / fps)));
+    return base.map(() => d);
+}
 
 function resolveXY(pos, w, h) {
     const mon = Main.layoutManager.primaryMonitor;
@@ -135,8 +158,8 @@ export default class GifdeskWidgetsExtension {
     enable() {
         this._live = new Map();
         this._impl = {
-            Show: (id, file, framesDir, durs, pos, w, h, locked, opacity) =>
-                this._show(id, file, framesDir, durs, pos, w, h, locked, opacity),
+            Show: (id, file, framesDir, durs, pos, w, h, locked, opacity, fps) =>
+                this._show(id, file, framesDir, durs, pos, w, h, locked, opacity, fps),
             Stop: id => this._stop(id),
             StopAll: () => {
                 for (const id of [...this._live.keys()])
@@ -149,6 +172,17 @@ export default class GifdeskWidgetsExtension {
                 return ids.length ? ids.join('\n') : 'NONE';
             },
             Geometry: id => this._geometry(id),
+            SetFps: (id, fps) => {
+                const inst = this._live.get(id);
+                if (!inst)
+                    return false;
+                try {
+                    this._retime(inst, fps);
+                    return true;
+                } catch (e) {
+                    return false;
+                }
+            },
             SetLocked: (id, lock) => {
                 const inst = this._live.get(id);
                 if (!inst)
@@ -197,7 +231,7 @@ export default class GifdeskWidgetsExtension {
         this._impl = null;
     }
 
-    _show(id, file, framesDir, dursCsv, pos, w, h, locked, opacity) {
+    _show(id, file, framesDir, dursCsv, pos, w, h, locked, opacity, fps) {
         if (!id || !framesDir || !(w > 0 && h > 0))
             return false;
         this._stop(id);
@@ -230,12 +264,27 @@ export default class GifdeskWidgetsExtension {
         Main.uiGroup.add_child(actor);
         Main.uiGroup.set_child_above_sibling(actor, null);
         const inst = {
-            id, actor, icons, durs: data.durs, idx: 0, timer: 0,
+            id, actor, icons, base: data.durs, fps: 0,
+            durs: data.durs, idx: 0, timer: 0,
         };
         this._live.set(id, inst);
+        this._retime(inst, fps);
         if (data.pngs.length > 1)
             this._schedule(inst);
         return true;
+    }
+
+    // Retimiza en vivo: recalcula la duración por cuadro sin recrear el actor,
+    // así el GIF ni se para ni vuelve a su sitio (solo cambia el temporizador).
+    _retime(inst, fps) {
+        inst.fps = clampFps(fps);
+        inst.durs = frameDurs(inst.base, inst.fps);
+        if (inst.timer) {
+            GLib.source_remove(inst.timer);
+            inst.timer = 0;
+            if (inst.icons.length > 1)
+                this._schedule(inst);
+        }
     }
 
     _schedule(inst) {

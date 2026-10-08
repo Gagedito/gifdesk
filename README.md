@@ -82,20 +82,74 @@ nix run .#gifdesk -- --check --file ~/anim.gif   # probar sin instalar
 nix profile install .#gifdesk                     # instalar en tu perfil
 ```
 
-Con home-manager en tu flake:
+Con home-manager en tu flake (este bloque completo, tal cual, con solo tres
+datos por cambiar: `tu-usuario`, `x86_64-linux` y `home.stateVersion`):
 
 ```nix
-inputs.gifdesk.url = "path:/home/sabrina/Projects/gifdesk";  # o github:...
-
-home-manager.users.sabrina = {
-  imports = [ inputs.gifdesk.homeManagerModules.gifdesk ];
-  programs.gifdesk = {
-    enable = true;
-    package = inputs.gifdesk.packages.${pkgs.system}.gifdesk;
-    gnomeExtension = true;
+{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    gifdesk.url = "github:Gagedito/gifdesk";     # este repo
+    home-manager.url = "github:nix-community/home-manager";
+    home-manager.inputs.nixpkgs.follows = "nixpkgs";   # una sola copia de nixpkgs
   };
-};
+
+  outputs = { nixpkgs, gifdesk, home-manager, ... }:
+    let
+      system = "x86_64-linux";              # o "aarch64-linux"
+      pkgs = nixpkgs.legacyPackages.${system};
+    in {
+      homeConfigurations."tu-usuario" = home-manager.lib.homeManagerConfiguration {
+        inherit pkgs;                     # OJO: sin `system` aqui, home-manager no lo admite
+        modules = [
+          gifdesk.homeManagerModules.gifdesk
+          {
+            # Requisitos de home-manager, no de gifdesk:
+            home.username = "tu-usuario";
+            home.homeDirectory = "/home/tu-usuario";
+            home.stateVersion = "24.11";
+
+            programs.gifdesk = {
+              enable = true;
+              package = gifdesk.packages.${system}.gifdesk;
+              gnomeExtension = true;       # enlaza el motor del shell
+            };
+          }
+        ];
+      };
+    };
+}
 ```
+
+Activar con `home-manager switch --configuration tu-usuario`.
+
+Tres datos que hay que cambiar por los tuyos: `tu-usuario`, `x86_64-linux`
+(`aarch64-linux` en Raspberry Pi y en Apple Silicon) y `home.stateVersion`
+(el de tu home-manager actual).
+
+Para seguir una version que aun no esta publicada, cambia solo la URL del
+input por la que te interese:
+
+| Quieres | `gifdesk.url` |
+|---------|---------------|
+| La versión publicada | `github:Gagedito/gifdesk` |
+| Una rama concreta | `github:Gagedito/gifdesk/nombre-de-la-rama` |
+| Tu propia copia en disco | `path:./gifdesk` |
+
+El comando para probarlo sin instalar nada:
+
+```bash
+nix run github:Gagedito/gifdesk#gifdesk -- --check --file ~/anim.gif
+```
+
+Si quieres la configuración en `home.nix` en vez de dentro del flake, pásale
+el paquete con `_module.args`: añade
+
+```nix
+          ({ ... }: { _module.args.gifdeskPackage = gifdesk.packages.${system}.gifdesk; })
+```
+
+a la lista `modules`, y en `home.nix` usa `package = gifdeskPackage;`.
 
 Tras activar la extensión (`gnome-extensions enable gifdesk-widgets@gifdesk.local`)
 cierra e inicia sesión (Wayland) y confirma con `gifdesk --check`.
@@ -144,8 +198,16 @@ viejo (vale para ambas ediciones).
   reproducen; los estaticos se muestran fijos).
 - **Anadir**: copia el archivo a la libreria (tu original no se toca; si el
   nombre existe y el contenido difiere, se guarda como `nombre_1.ext`).
-- **Borrar**: pide confirmacion y elimina archivo + su instancia.
+- **Borrar**: pide confirmacion y elimina archivo + su instancia. Tambien con
+  la tecla **Supr** sobre la fila seleccionada.
+- **Filtrar**: la caja de busqueda deja solo los GIFs cuyo nombre contiene el
+  texto. Con **Borrar filtrados** se va de golpe todo lo que muestre el filtro
+  (lo clasico para quitarte los de prueba y quedarte con los que te gustan).
 - **Mostrar** (o doble clic): lo pone en pantalla como instancia independiente.
+
+> Con 500+ GIFs la galeria no se para: las marcas de estado salen de una sola
+> consulta al motor y las dimensiones se leen del cache de cuadros (no se
+> lanza ffprobe por fila).
 
 ### Editor (por GIF seleccionado)
 
@@ -157,6 +219,9 @@ Todo lo que cambies aqui afecta **solo al GIF seleccionado** (mira
   los campos y luego **Aplicar cambios**). El slider siempre refleja lo guardado.
 - **Posicion**: esquinas (`TL TR BL BR C`) o `X,Y` personalizado.
 - **Opacidad**: slider 0-100 (100 = opaco, 0 = invisible pero sigue corriendo).
+- **Velocidad**: slider 0-60 fps, `0` = el GIF a su ritmo original, `1-60` =
+  fuerza N cuadros por segundo **solo en ese GIF**. Se aplica en vivo, sin
+  relanzar: el GIF no vuelve a su sitio. Boton **Original** para quitarlo.
 - **Aplicar cambios**: guarda y relanza esa instancia con lo nuevo. Si no
   cambiaste nada, no hace nada (para no devolverlo a su sitio en vano). Se
   bloquea mientras trabaja para evitar dobles pulsaciones.
@@ -211,6 +276,7 @@ gifdesk --dry-run --file rem.gif          # ver el comando mpv sin abrir ventana
 | `--size WxH` | Tamano (defecto: nativo del archivo) |
 | `--pos GEOM` | `X,Y` o `TL TR BL BR C` (defecto: `BR`, margen 16px). En Wayland la posicion final la decide el compositor + regla KWin |
 | `--opacity PCT` | 0-100 (defecto 100). Requiere KWin (va por regla) |
+| `--fps N` | Velocidad de **esa** imagen: `0` = ritmo original del GIF, `1-60` = forzar N cuadros/s |
 | `--click-through` | Solo esa vez: ignora el raton |
 | `--autostart` | Sin `--id`: clasica + todas las instancias. Con `--id`: solo esa, segun su config |
 | `--check` | Valida archivo y entorno sin abrir ventana |
@@ -228,7 +294,7 @@ gifdesk --dry-run --file rem.gif          # ver el comando mpv sin abrir ventana
 | `~/.local/share/gnome-shell/extensions/gifdesk-widgets@gifdesk.local/` | Extension de posicionamiento (solo GNOME) |
 | `~/.local/share/gifdesk/library/` | Tus GIF/WebP (copias de trabajo) |
 | `~/.config/gifdesk/gifdesk.conf` | Config clasica (legado; la GUI la vacia al adoptar) |
-| `~/.config/gifdesk/instances/<id>.conf` | Config por instancia: `FILE MODE SIZE POS LOCKED REV OPACITY` |
+| `~/.config/gifdesk/instances/<id>.conf` | Config por instancia: `FILE MODE SIZE POS LOCKED REV OPACITY FPS` |
 | `~/.config/gifdesk/input.conf` | Atajos extra de mpv (editable; por defecto sin atajos activos) |
 | `~/.config/autostart/gifdesk.desktop` | Autostart XDG |
 | `~/.local/share/applications/gifdesk-gui.desktop` | Entrada del menu |
@@ -287,6 +353,12 @@ dibuja cada instancia como un **actor Clutter** (no una ventana):
 - **Opacidad real** 0-100 del actor (aquí sí aplica).
 - Posición/tamaño exactos por instancia; `gifdesk --where` y fijar posición
   leen la geometría del actor.
+- **Velocidad por GIF** (`--fps` / `FPS=`): el motor re-timiza los cuadros al
+  vuelo, sin recrear el actor, así que el GIF no se para ni vuelve a su sitio.
+
+> Si actualizas el motor desde una versión anterior, **cierra y vuelve a iniciar
+> sesión**: la interfaz D-Bus cambió (`Show` lleva un argumento más y hay un
+> `SetFps` nuevo). Con el motor viejo, `gifdesk` avisa de que no responde.
 
 ```bash
 ./install.sh --with-gnome   # en sesion GNOME se hace solo (o usa el flake)
