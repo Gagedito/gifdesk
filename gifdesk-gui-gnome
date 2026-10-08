@@ -20,7 +20,7 @@ try:
     import gi
     gi.require_version("Gtk", "4.0")
     gi.require_version("Adw", "1")
-    from gi.repository import Adw, Gio, GLib, Gtk
+    from gi.repository import Adw, Gdk, Gio, GLib, Gtk
     # libadwaita >= 1.2: ToastOverlay, MessageDialog. Sin 1.2 no arrancamos.
     if not hasattr(Adw, "ToastOverlay") or not hasattr(Adw, "MessageDialog"):
         raise ImportError("se necesita libadwaita >= 1.2")
@@ -47,7 +47,7 @@ PRESETS = ["BR", "BL", "TR", "TL", "C", "Personalizada…"]
 
 def blank_cfg():
     return {"FILE": "", "MODE": "widget", "SIZE": "", "POS": "BR",
-            "LOCKED": "no", "REV": "0", "OPACITY": "100"}
+            "LOCKED": "no", "REV": "0", "OPACITY": "100", "FPS": "0"}
 
 
 def inst_id(path):
@@ -83,6 +83,11 @@ def read_config(path):
     except (TypeError, ValueError):
         op = 100
     cfg["OPACITY"] = str(max(0, min(100, op)))
+    try:
+        fps = int(cfg.get("FPS", "0") or 0)
+    except (TypeError, ValueError):
+        fps = 0
+    cfg["FPS"] = str(max(0, min(60, fps)))
     if cfg["POS"] not in ("TL", "TR", "BL", "BR", "C") and "," not in cfg["POS"]:
         cfg["POS"] = "BR"
     return cfg
@@ -100,6 +105,7 @@ def write_config(cfg, path):
         f'LOCKED={cfg.get("LOCKED", "no")}\n'
         f'REV={cfg.get("REV", "0")}\n'
         f'OPACITY={cfg.get("OPACITY", "100")}\n'
+        f'FPS={cfg.get("FPS", "0")}\n'
     )
 
 
@@ -163,6 +169,8 @@ def is_running_inst(iid):
 
 
 def running_ids():
+    """Ids mostrandose. UNA llamada: el motor GNOME responde con todos y, sin
+    motor, `gifdesk --list` ya no relanza el binario por instancia."""
     rc, out = run_gifdesk("--list")
     ids = []
     if rc == 0:
@@ -171,6 +179,20 @@ def running_ids():
             if len(parts) >= 2 and parts[1] == "corriendo":
                 ids.append(parts[0])
     return ids
+
+
+def live_fps(iid, fps):
+    """Cambia la velocidad en vivo via motor (sin recrear el actor).
+    True si quedo puesta (asi conserva la posicion donde la arrastraste)."""
+    px = engine_proxy()
+    if px is None:
+        return False
+    try:
+        ok = px.call_sync("SetFps", GLib.Variant("(si)", (iid, int(fps))),
+                          Gio.DBusCallFlags.NONE, 5000, None).unpack()[0]
+        return bool(ok)
+    except GLib.Error:
+        return False
 
 
 def engine_proxy():
@@ -199,7 +221,70 @@ def live_lock(iid, lock):
         return False
 
 
+MEDIA_CACHE = {}   # path -> (w, h, frames)
+FRAMES_INDEX = None  # sha1_... -> (w, h, n), del cache del motor
+
+
+def frames_index():
+    """WxH y nº de cuadros desde el cache del motor, sin ffprobe.
+
+    `gifdesk` preextrae los PNG a ~/.cache/gifdesk/frames/<sha1_WxH>/. Leyendo
+    ese indice, los GIF ya mostrados se describen gratis; ffprobe (~90 ms por
+    archivo) queda solo para los que no estan cacheados.
+    """
+    global FRAMES_INDEX
+    if FRAMES_INDEX is not None:
+        return FRAMES_INDEX
+    FRAMES_INDEX = {}
+    rc, out = run_gifdesk("--frames-cache")
+    if rc != 0:
+        return FRAMES_INDEX
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) != 3:
+            continue
+        path, geo, n = parts
+        key = Path(path).name.split("_")[0]
+        m = re.match(r"^(\d+)x(\d+)$", geo)
+        if key and m and n.isdigit():
+            # El indice guarda las variantes por tamano: nos quedamos con la
+            # mayor (el motor respeta SIZE de la instancia).
+            cur = FRAMES_INDEX.get(key)
+            cand = (int(m.group(1)), int(m.group(2)), int(n))
+            if cur is None or cand[0] * cand[1] > cur[0] * cur[1]:
+                FRAMES_INDEX[key] = cand
+    return FRAMES_INDEX
+
+
+def cached_dims(path):
+    """Dimensiones del cache del motor para este archivo, o None."""
+    import hashlib
+    try:
+        h = hashlib.sha1()
+        with open(path, "rb") as f:
+            for blk in iter(lambda: f.read(1 << 20), b""):
+                h.update(blk)
+        return frames_index().get(h.hexdigest()[:16])
+    except OSError:
+        return None
+
+
 def media_dims(path):
+    """(ancho, alto, cuadros|None). Primero el cache del motor (gratis),
+    si no ffprobe (cacheado en memoria).
+
+    ffprobe son ~90 ms y se llamaba POR FILA: con 500 GIFs eran 45 s de
+    congelamiento en cada arranque.
+    """
+    if not path:
+        return None, None, None
+    key = str(path)
+    if key in MEDIA_CACHE:
+        return MEDIA_CACHE[key]
+    hit = cached_dims(path)
+    if hit is not None:
+        MEDIA_CACHE[key] = hit
+        return hit
     try:
         p = subprocess.run(
             ["ffprobe", "-v", "error", "-select_streams", "v:0",
@@ -209,22 +294,30 @@ def media_dims(path):
         parts = p.stdout.strip().split(",")
         if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
             frames = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else None
-            return int(parts[0]), int(parts[1]), frames
+            res = (int(parts[0]), int(parts[1]), frames)
+            MEDIA_CACHE[key] = res
+            return res
     except (OSError, subprocess.SubprocessError):
         pass
     return None, None, None
 
 
+def file_size(path):
+    """Tamano legible. Barato (stat): se usa en cada fila de la galeria."""
+    try:
+        b = Path(path).stat().st_size
+    except OSError:
+        return "?"
+    return f"{b // 1024} KB" if b < 1024 * 1024 else f"{b / 1048576:.1f} MB"
+
+
 def file_info(path):
+    """Tamano + dimensiones. Con ffprobe: solo para el GIF seleccionado."""
     w, h, frames = media_dims(path)
     if w and h:
         extra = f" · {frames}f" if frames else ""
-        return f"{w}×{h}{extra}"
-    try:
-        kb = Path(path).stat().st_size // 1024
-        return f"{kb} KB"
-    except OSError:
-        return "?"
+        return f"{w}×{h}{extra} · {file_size(path)}"
+    return file_size(path)
 
 
 def unique_dest(name):
@@ -292,7 +385,54 @@ def ext_state():
         return "missing"
 
 
-# ---------- widgets (solo GTK4 núcleo + Adw 1.0–1.2) ----------
+def _probe_all(paths):
+    """Completa en un hilo lo que el indice del motor no cubre (los GIFs
+    nunca mostrados). Solo se paga una vez: queda en MEDIA_CACHE."""
+    for p in paths:
+        if str(p) not in MEDIA_CACHE and cached_dims(p) is None:
+            media_dims(p)
+    return (0, "")
+
+
+# ---------- confirmacion (AlertDialog >=1.5; MessageDialog en 1.2-1.4) ----------
+
+def ask(parent_app, parent, heading, body, ok_label="_Borrar", on_ok=None):
+    """Si/no con Adw. on_ok() solo si el usuario confirma.
+
+    Adw.MessageDialog tiene `add_response` (singular): llamar `add_responses`
+    lanza AttributeError y el boton no hacia NADA (fallo silencioso, porque
+    el .desktop se come stderr). Preferimos AlertDialog (>=1.5) y solo caemos
+    en MessageDialog en libadwaita antiguo.
+    """
+    if hasattr(Adw, "AlertDialog"):
+        dlg = Adw.AlertDialog.new(heading, body)
+        dlg.add_response("cancel", "_Cancelar")
+        dlg.add_response("ok", ok_label)
+        dlg.set_response_appearance("ok", Adw.ResponseAppearance.DESTRUCTIVE)
+        dlg.set_default_response("cancel")
+        dlg.set_close_response("cancel")
+
+        def on_resp(d, resp):
+            if resp == "ok" and on_ok:
+                on_ok()
+
+        dlg.connect("response", on_resp)
+        Adw.Dialog.present(dlg, parent)
+        return dlg
+
+    dlg = Adw.MessageDialog.new(parent, heading, body)
+    dlg.add_response("cancel", "_Cancelar")
+    dlg.add_response("ok", ok_label)
+    dlg.set_response_appearance("ok", Adw.ResponseAppearance.DESTRUCTIVE)
+    dlg.set_default_response("cancel")
+    dlg.set_close_response("cancel")
+    dlg.connect("response",
+                lambda d, resp: on_ok() if resp == "ok" and on_ok else None)
+    dlg.present()
+    return dlg
+
+
+# ---------- widgets (solo GTK4 nucleo + Adw 1.0-1.2) ----------
 
 def spin_row(title, subtitle, lo, hi, step=1):
     """Fila con etiqueta + Gtk.SpinButton. Devuelve (ListBoxRow, SpinButton)."""
@@ -346,11 +486,26 @@ class GestorApp(Adw.Application):
         self.cfg = blank_cfg()
         self.cur_id = None
         self._syncing = False
+        self.win = None
+        # Ids en pantalla segun el motor (una sola llamada). Se usa para pintar
+        # las marcas sin lanzar un subproceso por fila.
+        self._shown_ids = set()
+        # Filtro de la galeria (texto busqueda). Vacio = todas.
+        self.filter_text = ""
 
     def do_activate(self):
+        # Lanzar desde el menu con la app ya abierta: solo se enfoca la
+        # ventana existente. Antes se creaba otra y se reconstruia la galeria
+        # entera (lento con muchos GIFs).
+        if self.win is not None:
+            self.win.present()
+            return
         win = Adw.ApplicationWindow(application=self)
         win.set_title("gifdesk — gestor (GNOME)")
         win.set_default_size(980, 680)
+        # Guardar la ventana: reutilizarla evita que cada launch del menu
+        # construya otra (con la galeria entera) encima.
+        self.win = win
 
         toast_overlay = Adw.ToastOverlay()
         win.set_content(toast_overlay)
@@ -388,16 +543,31 @@ class GestorApp(Adw.Application):
         side_title.add_css_class("heading")
         side_title.set_margin_top(8)
         side_title.set_margin_start(12)
+        side.append(side_title)
+
+        # Filtro: con 500 GIFs hay que poder llegar al que se busca.
+        self.search = Gtk.SearchEntry(hexpand=True)
+        self.search.set_placeholder_text("Filtrar GIFs…")
+        self.search.set_margin_start(6)
+        self.search.set_margin_end(6)
+        self.search.set_margin_bottom(6)
+        self.search.connect("search-changed", self._on_search)
+        side.append(self.search)
+
         side_box = Gtk.ScrolledWindow(vexpand=True)
         side_box.set_margin_top(6)
         side_box.set_margin_start(6)
         side_box.set_margin_end(6)
-        side.append(side_title)
         side.append(side_box)
         self.gallery = Gtk.ListBox(selection_mode=Gtk.SelectionMode.SINGLE)
         self.gallery.add_css_class("boxed-list")
         side_box.set_child(self.gallery)
         self.gallery.connect("row-selected", self._on_row_selected)
+        # Supr borra la fila seleccionada (sin apuntar al boton). El filtro
+        # se queda: al borrar pruebas sigues viendo el resto de la lista.
+        keys = Gtk.EventControllerKey()
+        keys.connect("key-pressed", self._on_gallery_key)
+        self.gallery.add_controller(keys)
 
         side_btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         side_btns.set_margin_top(6)
@@ -405,18 +575,28 @@ class GestorApp(Adw.Application):
         side_btns.set_margin_start(6)
         side_btns.set_margin_end(6)
         side.append(side_btns)
-        for label, fn, css in (("Añadir", self.do_add, None),
-                               ("Borrar", self.do_delete, None),
-                               ("Mostrar", self.do_show, "suggested-action")):
-            b = Gtk.Button(label=label)
-            b.set_hexpand(True)
-            if css:
-                b.add_css_class(css)
-            if fn in (self.do_add, self.do_delete):
-                b.connect("clicked", lambda _b, f=fn: f(win))
-            else:
-                b.connect("clicked", lambda _b: fn())
+        # Los handlers se conectan uno a uno: comparar metodos enlazados con
+        # `is`/`in` es falso (cada acceso crea un objeto nuevo) y dejaba los
+        # botones sin conexion -> no hacian nada.
+        add_btn = Gtk.Button(label="Añadir", hexpand=True)
+        add_btn.connect("clicked", lambda _b: self.do_add(win))
+        del_btn = Gtk.Button(label="Borrar", hexpand=True)
+        del_btn.connect("clicked", lambda _b: self.do_delete(win))
+        show_btn = Gtk.Button(label="Mostrar", hexpand=True)
+        show_btn.add_css_class("suggested-action")
+        show_btn.connect("clicked", lambda _b: self.do_show())
+        for b in (add_btn, del_btn, show_btn):
             side_btns.append(b)
+
+        # Borrado masivo: borra lo que deje el filtro (limpiar los de test).
+        self.bulk_btn = Gtk.Button(label="Borrar filtrados")
+        self.bulk_btn.set_margin_start(6)
+        self.bulk_btn.set_margin_end(6)
+        self.bulk_btn.set_margin_bottom(6)
+        self.bulk_btn.set_tooltip_text(
+            "Borra de la galería todos los GIF que muestra el filtro")
+        self.bulk_btn.connect("clicked", lambda _b: self.do_delete_many(win))
+        side.append(self.bulk_btn)
 
         # --- contenido: editor ---
         content_scroll = Gtk.ScrolledWindow(vexpand=True)
@@ -508,6 +688,20 @@ class GestorApp(Adw.Application):
             0, 100)
         self.spin_opa.get_adjustment().set_value(100)
         win_list.append(self.row_opa)
+        # Velocidad: 0 = el GIF a su ritmo original; 1-60 = forzar N fps.
+        self.row_fps, self.spin_fps = spin_row(
+            "Velocidad (fps)", "0 = ritmo original del GIF · 1-60 = cuadros/s fijos",
+            0, 60)
+        self.spin_fps.get_adjustment().set_value(0)
+        win_list.append(self.row_fps)
+        fps_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        fps_list.add_css_class("boxed-list")
+        row_orig, btn_orig = action_button_row(
+            "Velocidad original", "Quita el limite de fps: vuelve a su ritmo",
+            "Original")
+        btn_orig.connect("clicked", lambda _b: self.do_fps(0))
+        fps_list.append(row_orig)
+        g_win.add(fps_list)
         self.row_lock = Adw.ActionRow(title="Posición: libre")
         self.row_lock.set_subtitle("Libre = se puede mover · Bloqueada = ignora el ratón")
         win_list.append(self.row_lock)
@@ -549,6 +743,9 @@ class GestorApp(Adw.Application):
         win.present()
         self.refresh_banner()
         self.refresh_list()
+        # Las dimensiones de cada GIF se piden despues, en segundo plano y de
+        # uno en uno: el editor ya se puede usar mientras tanto.
+        GLib.idle_add(self._fill_dims, priority=GLib.PRIORITY_LOW)
 
     # ---------- utilidades UI ----------
 
@@ -568,6 +765,42 @@ class GestorApp(Adw.Application):
             GLib.idle_add(idle)
         threading.Thread(target=run, daemon=True).start()
 
+    def row_info(self, p, index):
+        """Subtitulo de una fila: dimensiones si ya las sabemos (cache del
+        motor), si no solo el tamano. Nunca bloquea con ffprobe."""
+        try:
+            import hashlib
+            h = hashlib.sha1()
+            with open(p, "rb") as f:
+                for blk in iter(lambda: f.read(1 << 20), b""):
+                    h.update(blk)
+            hit = index.get(h.hexdigest()[:16])
+        except OSError:
+            hit = None
+        if hit:
+            w, h, n = hit
+            return f"{w}×{h} · {n}f"
+        return file_size(p)
+
+    def _fill_dims(self):
+        """Enriquece las filas con WxH (ffprobe) en 2o plano, sin congelar.
+
+        Antes esto pasaba al pintar cada fila: era el arranque lento. Ahora la
+        lista es util al instante y las dimensiones llegan al terminar.
+        """
+        files = self.library_files()
+        self.in_thread(lambda: _probe_all(files), self._dims_ready)
+        return False
+
+    def _dims_ready(self, res):
+        rc, _ = res
+        if rc != 0:
+            return
+        p = self.selected_path()
+        if p is not None:
+            self.row_current.set_subtitle(file_info(p))
+        self.refresh_list(select_name=p.name if p else None)
+
     def refresh_banner(self):
         st = ext_state()
         if st == "enabled":
@@ -576,14 +809,32 @@ class GestorApp(Adw.Application):
             self.info_label.set_text("Motor GNOME apagado: instala/activa la extensión gifdesk (install.sh --with-gnome o el flake) y re-loguea.")
 
     def library_files(self):
-        return sorted(
+        """GIFs de la libreria, ya filtrados por el texto de busqueda."""
+        files = sorted(
             (p for p in LIB_DIR.iterdir()
              if p.is_file() and p.suffix.lower() in SUPPORTED),
             key=lambda p: p.name.lower())
+        needle = self.filter_text.strip().lower()
+        if needle:
+            files = [p for p in files if needle in p.name.lower()]
+        return files
 
     def selected_path(self):
         row = self.gallery.get_selected_row()
         return getattr(row, "_path", None) if row is not None else None
+
+    def _on_search(self, entry):
+        self.filter_text = entry.get_text()
+        self.refresh_list()
+
+    def _on_gallery_key(self, _ctrl, keyval, _code, _state):
+        """Supr/Retroceso borra la fila enfocada (si hay seleccion)."""
+        if keyval not in (Gdk.KEY_Delete, Gdk.KEY_BackSpace):
+            return False
+        if self.selected_path() is None:
+            return False
+        self.do_delete(self.props.active_window)
+        return True
 
     # ---------- galería ----------
 
@@ -597,13 +848,16 @@ class GestorApp(Adw.Application):
                 break
             self.gallery.remove(child)
         files = self.library_files()
+        # Una sola consulta al motor para todas las marcas: antes era un
+        # subproceso por fila (con 500 GIFs, 500 procesos en cada refresco).
+        self._shown_ids = set(running_ids())
+        # Indice de dimensiones en una llamada (gratis si esta cacheado).
+        index = frames_index()
         sel_row = None
         for p in files:
-            iid = resolve_id(p)
-            on = is_running_inst(iid)
-            mark = " · en pantalla" if on else ""
+            mark = " · en pantalla" if resolve_id(p) in self._shown_ids else ""
             row = Adw.ActionRow(title=p.name)
-            row.set_subtitle(f"{file_info(p)}{mark}")
+            row.set_subtitle(f"{self.row_info(p, index)}{mark}")
             row._path = p
             self.gallery.append(row)
             if select_name is not None and p.name == select_name:
@@ -681,6 +935,11 @@ class GestorApp(Adw.Application):
                 self.spin_opa.set_value(int(self.cfg.get("OPACITY", "100")))
             except (TypeError, ValueError):
                 self.spin_opa.set_value(100)
+            try:
+                self.spin_fps.set_value(
+                    max(0, min(60, int(self.cfg.get("FPS", "0") or 0))))
+            except (TypeError, ValueError):
+                self.spin_fps.set_value(0)
             pos = self.cfg.get("POS", "BR")
             if pos in PRESETS[:5]:
                 self.dropdown.set_selected(PRESETS.index(pos))
@@ -724,6 +983,7 @@ class GestorApp(Adw.Application):
         self.row_y.set_visible(custom)
 
     def collect_editor(self):
+        self.cfg["FPS"] = str(int(self.spin_fps.get_value()))
         w, h = int(self.spin_w.get_value()), int(self.spin_h.get_value())
         if w or h:
             if w <= 0 or h <= 0:
@@ -773,34 +1033,53 @@ class GestorApp(Adw.Application):
         dlg.connect("response", on_response)
         dlg.show()
 
+    def delete_path(self, p):
+        """Borra archivo + instancia de un GIF. True si el archivo fue."""
+        MEDIA_CACHE.pop(str(p), None)
+        iid = resolve_id(p)
+        run_inst(iid, "--stop")
+        try:
+            inst_conf(iid).unlink(missing_ok=True)
+        except OSError:
+            pass
+        try:
+            p.unlink()
+        except OSError as e:
+            self.toast(f"No se pudo borrar {p.name}: {e}")
+            return False
+        return True
+
     def do_delete(self, win):
+        """Borrar el GIF seleccionado (el boton o la tecla Supr)."""
         p = self.selected_path()
         if p is None:
             return
-        dlg = Adw.MessageDialog.new(win, "Borrar de la librería?",
-                                    f"{p.name}\nSe elimina el archivo y su instancia.")
-        dlg.add_responses("cancel", "_Cancelar", "ok", "_Borrar")
-        dlg.set_response_appearance("ok", Adw.ResponseAppearance.DESTRUCTIVE)
-        dlg.set_default_response("cancel")
-        dlg.set_close_response("cancel")
+        ask(self, win, "Borrar de la galería?",
+            f"{p.name}\nSe elimina el archivo y su instancia.",
+            ok_label="_Borrar", on_ok=lambda: self._delete_done([p]))
 
-        def on_response(d, resp):
-            if resp == "ok":
-                iid = resolve_id(p)
-                run_inst(iid, "--stop")
-                try:
-                    inst_conf(iid).unlink(missing_ok=True)
-                except OSError:
-                    pass
-                try:
-                    p.unlink()
-                except OSError as e:
-                    self.toast(f"No se pudo borrar: {e}")
-                    return
-                self.refresh_list()
-                self.toast(f"Borrado: {p.name}")
-        dlg.connect("response", on_response)
-        dlg.present()
+    def do_delete_many(self, win):
+        """Borrar todo lo que deja el filtro (limpiar los GIFs de test)."""
+        victims = self.library_files()
+        if not victims:
+            self.toast("No hay GIFs que borrar con ese filtro")
+            return
+        shown = [p.name for p in victims[:4]]
+        extra = f"\n… y {len(victims) - 4} más" if len(victims) > 4 else ""
+        ask(self, win, f"Borrar {len(victims)} GIFs?",
+            "\n".join(shown) + extra + "\n\nSe borran archivo e instancia.",
+            ok_label=f"_Borrar {len(victims)}",
+            on_ok=lambda: self._delete_done(victims))
+
+    def _delete_done(self, victims):
+        gone = [p for p in victims if self.delete_path(p)]
+        self.refresh_list()
+        if len(gone) == 1:
+            self.toast(f"Borrado: {gone[0].name}")
+        elif gone:
+            self.toast(f"Borrados {len(gone)} GIFs")
+        else:
+            self.toast("No se pudo borrar nada")
 
     def do_show(self):
         p = self.selected_path()
@@ -847,7 +1126,7 @@ class GestorApp(Adw.Application):
             return
         adopt_legacy(self.cfg.get("FILE", ""))
         disk = read_config(inst_conf(iid))
-        changed = {k for k in ("SIZE", "MODE", "POS", "OPACITY")
+        changed = {k for k in ("SIZE", "MODE", "POS", "OPACITY", "FPS")
                    if self.cfg.get(k, "") != disk.get(k, "")}
         write_config(self.cfg, inst_conf(iid))
         if changed:
@@ -859,20 +1138,9 @@ class GestorApp(Adw.Application):
             self.refresh_status()
             self.toast(f"Sin cambios (sigue igual @ {self.cfg['POS'] or 'nativo'})")
             return
-        if changed == {"OPACITY"} and is_running_inst(iid):
-            # Solo opacidad: reaplicar en vivo (el actor la toma al vuelo).
-            self.toast("Aplicando opacidad en vivo…")
-
-            def done_op(res):
-                rc, out = res
-                if rc != 0:
-                    self.toast(f"No se pudo aplicar: {out[:200]}")
-                else:
-                    self.toast(f"Opacidad: {self.cfg['OPACITY']}%")
-                self.sync_editor()
-                self.refresh_status()
-
-            self.in_thread(lambda: run_inst(iid, "--autostart"), done_op)
+        # Solo fps: se cambia en vivo (el actor no se recrea, no se mueve).
+        if changed == {"FPS"} and is_running_inst(iid):
+            self.do_fps(int(self.cfg["FPS"]))
             return
         self.toast("Aplicando…")
         self.btn_apply.set_sensitive(False)
@@ -888,6 +1156,42 @@ class GestorApp(Adw.Application):
             self.btn_apply.set_sensitive(True)
 
         self.in_thread(lambda: run_inst(iid, "--autostart"), done)
+
+    def do_fps(self, fps):
+        """Velocidad de ESA imagen. En vivo si el motor responde; si no,
+        relanza (como cualquier otro cambio)."""
+        iid = self.cur_id
+        if iid is None:
+            self.toast("Selecciona un GIF de la galería")
+            return
+        fps = max(0, min(60, int(fps)))
+        self.cfg["FPS"] = str(fps)
+        self.spin_fps.set_value(fps)
+        write_config(self.cfg, inst_conf(iid))
+        if fps > 0:
+            bump_rev(inst_conf(iid))
+        if not is_running_inst(iid):
+            self.toast("Guardado (se aplicará al mostrarlo)")
+            return
+
+        def work():
+            # En vivo primero: conserva la posicion donde la arrastraste.
+            if live_fps(iid, fps):
+                return ("live", None)
+            run_inst(iid, "--autostart")
+            return ("relaunch", None)
+
+        def done(res):
+            kind, _ = res
+            self.toast(f"Velocidad: {fps} fps" if fps else "Velocidad: original")
+            self.sync_editor()
+            self.refresh_status()
+            self.refresh_list(select_name=Path(self.cfg["FILE"]).name
+                              if self.cfg.get("FILE") else None)
+            if kind == "relaunch":
+                self.toast("Motor sin respuesta en vivo: relanzado")
+
+        self.in_thread(work, done)
 
     def do_lock_toggle(self):
         iid = self.cur_id

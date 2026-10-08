@@ -23,7 +23,7 @@ PRESETS = ["BR", "BL", "TR", "TL", "C", "Personalizada..."]
 
 def blank_cfg():
     return {"FILE": "", "MODE": "widget", "SIZE": "", "POS": "BR",
-            "LOCKED": "no", "REV": "0", "OPACITY": "100"}
+            "LOCKED": "no", "REV": "0", "OPACITY": "100", "FPS": "0"}
 
 
 def inst_id(path):
@@ -103,6 +103,11 @@ def read_config(path=None):
     except (TypeError, ValueError):
         op = 100
     cfg["OPACITY"] = str(max(0, min(100, op)))
+    try:
+        fps = int(cfg.get("FPS", "0") or 0)
+    except (TypeError, ValueError):
+        fps = 0
+    cfg["FPS"] = str(max(0, min(60, fps)))
     if cfg["POS"] not in ("TL", "TR", "BL", "BR", "C") and "," not in cfg["POS"]:
         cfg["POS"] = "BR"
     return cfg
@@ -120,6 +125,7 @@ def write_config(cfg, path=None):
         f'LOCKED={cfg.get("LOCKED", "no")}\n'
         f'REV={cfg.get("REV", "0")}\n'
         f'OPACITY={cfg.get("OPACITY", "100")}\n'
+        f'FPS={cfg.get("FPS", "0")}\n'
     )
 
 
@@ -148,6 +154,19 @@ def is_running_inst(iid):
     return rc == 0
 
 
+def running_ids():
+    """Ids mostrandose, en UNA llamada. Antes era un subproceso por fila
+    (con 500 GIFs, 500 procesos en cada refresco de la galeria)."""
+    rc, out = run_gifdesk("--list")
+    ids = set()
+    if rc == 0:
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[1] == "corriendo":
+                ids.add(parts[0])
+    return ids
+
+
 def send_ipc_sock(sockname, *args):
     """Un comando al socket IPC indicado. Dict con 'error' si falla."""
     import json as _json
@@ -172,6 +191,39 @@ def send_ipc_sock(sockname, *args):
                 pass
 
 
+def live_speed(iid, speed):
+    """Aplica la velocidad al mpv en vivo por su socket IPC (sin relanzar,
+    asi que el GIF no vuelve a su sitio). True si mpv la acepto."""
+    if speed <= 0:
+        return False
+    r = send_ipc_sock(f"socket-{iid}", "set_property", "speed", speed)
+    return r.get("error") == "success"
+
+
+def native_speed(path, fps):
+    """fps objetivo -> multiplicador de mpv, leyendo los fps nativos con
+    ffprobe (vacio si no se puede: el nucleo lo omite y va a ritmo original)."""
+    if not fps or fps <= 0:
+        return None
+    try:
+        import subprocess as _sp
+        p = _sp.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=avg_frame_rate", "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, timeout=10)
+        fr = p.stdout.strip().split(",")[0]
+        num, den = fr.split("/")
+        den_i = int(den)
+        if den_i <= 0:
+            return None
+        nat = int(num) / den_i
+    except Exception:
+        return None
+    if not (1 < nat < 240):
+        return None
+    return max(0.1, min(8.0, nat / fps))
+
+
 def live_lock(iid, lock):
     """Aplica bloqueo en vivo (sin relanzar ni mover). True si quedo puesto."""
     sock = f"socket-{iid}"
@@ -189,20 +241,25 @@ def live_lock(iid, lock):
 
 
 def file_info(path):
-    """(etiqueta) con dimensiones/cuadros via ffprobe, o tamano si falla."""
+    """(etiqueta) con dimensiones/cuadros via ffprobe, o tamano si falla.
+    Solo para el GIF seleccionado: en las filas va file_size (gratis)."""
     w, h, frames = media_dims(path)
     if w and h:
         extra = f", {frames}f" if frames else ""
-        return f"{w}x{h}{extra}"
-    try:
-        kb = Path(path).stat().st_size // 1024
-        return f"{kb} KB"
-    except OSError:
-        return "?"
+        return f"{w}x{h}{extra} · {file_size(path)}"
+    return file_size(path)
+
+
+MEDIA_CACHE = {}   # path -> (w, h, frames): ffprobe son ~90 ms, no por fila
 
 
 def media_dims(path):
-    """(ancho, alto, cuadros|None) via ffprobe. Funciones puras, testeables."""
+    """(ancho, alto, cuadros|None) via ffprobe, cacheado en memoria."""
+    if not path:
+        return None, None, None
+    key = str(path)
+    if key in MEDIA_CACHE:
+        return MEDIA_CACHE[key]
     try:
         p = subprocess.run(
             ["ffprobe", "-v", "error", "-select_streams", "v:0",
@@ -212,10 +269,21 @@ def media_dims(path):
         parts = p.stdout.strip().split(",")
         if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
             frames = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else None
-            return int(parts[0]), int(parts[1]), frames
+            res = (int(parts[0]), int(parts[1]), frames)
+            MEDIA_CACHE[key] = res
+            return res
     except (OSError, subprocess.SubprocessError):
         pass
     return None, None, None
+
+
+def file_size(path):
+    """Tamano legible (stat, gratis). Se usa en cada fila de la galeria."""
+    try:
+        b = Path(path).stat().st_size
+    except OSError:
+        return "?"
+    return f"{b // 1024} KB" if b < 1024 * 1024 else f"{b / 1048576:.1f} MB"
 
 
 def scale_size(size_str, factor, minimum=64):
@@ -407,6 +475,12 @@ def main():
     left = tk.LabelFrame(root, text="Galeria (libreria)", padx=6, pady=6)
     left.pack(side="left", fill="both", expand=True, padx=6, pady=6)
 
+    # Filtro: con 500 GIFs hay que poder llegar al que se busca (y borrar
+    # en bloque los de prueba sin pulsarlos uno a uno).
+    filter_var = tk.StringVar(value="")
+    tk.Entry(left, textvariable=filter_var).pack(fill="x", pady=(0, 4))
+    filter_var.trace_add("write", lambda *_a: refresh_list())
+
     lib_list = tk.Listbox(left, width=32)
     lib_list.pack(fill="both", expand=True)
 
@@ -456,10 +530,15 @@ def main():
         tick(key)
 
     def library_files():
-        return sorted(
+        """GIFs de la libreria, filtrados por el texto de busqueda."""
+        files = sorted(
             (p for p in LIB_DIR.iterdir()
              if p.is_file() and p.suffix.lower() in SUPPORTED),
             key=lambda p: p.name.lower())
+        needle = filter_var.get().strip().lower()
+        if needle:
+            files = [p for p in files if needle in p.name.lower()]
+        return files
 
     def refresh_list(select=None):
         # Sin seleccion explicita, conservar la actual (no saltar al 1).
@@ -468,10 +547,12 @@ def main():
             select = p0.name if p0 else None
         lib_list.delete(0, tk.END)
         files = library_files()
+        # Una sola consulta para todas las marcas [on] (antes: un subproceso
+        # por fila, 500 con una galeria grande).
+        shown = running_ids()
         sel_idx = None
         for i, p in enumerate(files):
-            iid = resolve_id(p)
-            mark = "  [on]" if is_running_inst(iid) else ""
+            mark = "  [on]" if resolve_id(p) in shown else ""
             lib_list.insert(tk.END, f"{p.name}{mark}")
             if select is not None and p.name == select:
                 sel_idx = i
@@ -480,6 +561,7 @@ def main():
             lib_list.see(sel_idx)
         elif files and not lib_list.curselection():
             lib_list.selection_set(0)
+        update_bulk_btn()
         on_select()
 
     def selected_path():
@@ -606,6 +688,7 @@ def main():
             return
         if not messagebox.askyesno("gifdesk", f"Borrar de la libreria?\n{p.name}"):
             return
+        MEDIA_CACHE.pop(str(p), None)
         iid = resolve_id(p)
         run_inst(iid, "--stop")
         try:
@@ -650,6 +733,47 @@ def main():
     tk.Button(btns, text="Mostrar", command=do_show).pack(side="left", expand=True, fill="x")
     lib_list.bind("<<ListboxSelect>>", on_select)
     lib_list.bind("<Double-Button-1>", lambda _e: do_show())
+    # Supr borra la fila seleccionada (sin apuntar al boton).
+    lib_list.bind("<Delete>", lambda _e: (do_delete(), "break")[1])
+    lib_list.bind("<BackSpace>", lambda _e: (do_delete(), "break")[1])
+    lib_list.focus_set()
+
+    def update_bulk_btn():
+        n = len(library_files())
+        bulk_btn.config(
+            text=f"Borrar filtrados ({n})" if n > 1 else "Borrar filtrados",
+            state="normal" if n > 1 else "disabled")
+
+    def do_delete_many():
+        """Borra todo lo que deja el filtro (limpiar los GIFs de prueba)."""
+        victims = library_files()
+        if not victims:
+            return
+        names = "\n".join(p.name for p in victims[:8])
+        extra = f"\n... y {len(victims) - 8} mas" if len(victims) > 8 else ""
+        if not messagebox.askyesno(
+                "gifdesk",
+                f"Borrar {len(victims)} GIFs?\n\n{names}{extra}\n\n"
+                "Se borran archivo e instancia."):
+            return
+        gone = 0
+        for p in victims:
+            MEDIA_CACHE.pop(str(p), None)
+            run_inst(resolve_id(p), "--stop")
+            try:
+                inst_conf(resolve_id(p)).unlink(missing_ok=True)
+            except OSError:
+                pass
+            try:
+                p.unlink()
+                gone += 1
+            except OSError as e:
+                messagebox.showerror("gifdesk", f"No se pudo borrar {p.name}: {e}")
+        refresh_list()
+        set_status(f"Borrados {gone} GIFs")
+
+    bulk_btn = tk.Button(left, text="Borrar filtrados", command=do_delete_many)
+    bulk_btn.pack(fill="x", pady=(4, 0))
 
     # ---------- editor (con scroll: entra a cualquier tamano) ----------
     right_outer = tk.LabelFrame(root, text="Modo editor", padx=6, pady=6)
@@ -736,6 +860,11 @@ def main():
     tk.Scale(right, from_=0, to=100, orient="horizontal", length=220,
              variable=opa_var).pack(anchor="w")
 
+    tk.Label(right, text="Velocidad (fps): 0 = original, 1-60 = fijos").pack(anchor="w")
+    fps_var = tk.IntVar(value=0)
+    tk.Scale(right, from_=0, to=60, orient="horizontal", length=220,
+             variable=fps_var).pack(anchor="w")
+
     tk.Label(right, text="Posicion:").pack(anchor="w", pady=(8, 0))
     pos_var = tk.StringVar(value=cfg["POS"] if cfg["POS"] in PRESETS[:5] else "Personalizada...")
     pos_menu = tk.OptionMenu(right, pos_var, *PRESETS)
@@ -771,6 +900,10 @@ def main():
             opa_var.set(int(cfg.get("OPACITY", "100")))
         except (TypeError, ValueError):
             opa_var.set(100)
+        try:
+            fps_var.set(max(0, min(60, int(cfg.get("FPS", "0") or 0))))
+        except (TypeError, ValueError):
+            fps_var.set(0)
         pos = cfg.get("POS", "BR")
         if pos in PRESETS[:5]:
             pos_var.set(pos)
@@ -779,6 +912,22 @@ def main():
             if "," in pos:
                 x, y = pos.split(",", 1)
                 x_var.set(x.strip()); y_var.set(y.strip())
+
+    def _fps_live(iid, fps):
+        """Velocidad en vivo; si mpv no la acepta, relanza (no queda a medias)."""
+        sp = native_speed(cfg.get("FILE", ""), fps)
+        if sp and live_speed(iid, sp):
+            return ("live", None)
+        run_inst(iid, "--autostart")
+        return ("relaunch", None)
+
+    def _fps_live_done(res):
+        kind, _out = res
+        fps = int(cfg.get("FPS", "0") or 0)
+        set_status(f"Velocidad: {fps} fps"
+                   + ("" if kind == "live" else " (relanzado)"))
+        sync_editor_from_config()
+        refresh_status_line()
 
     def do_apply():
         w, h = w_var.get().strip(), h_var.get().strip()
@@ -796,6 +945,7 @@ def main():
         else:
             cfg["POS"] = pv
         cfg["OPACITY"] = str(max(0, min(100, opa_var.get())))
+        cfg["FPS"] = str(max(0, min(60, fps_var.get())))
         iid = cur_id()
         if iid is None:
             messagebox.showinfo("gifdesk", "Selecciona un GIF de la galeria")
@@ -805,7 +955,7 @@ def main():
         # devolveria al GIF a su sitio para nada. Solo-opacidad va por regla
         # en vivo (forzar), sin relanzar ni mover.
         disk = read_config(inst_conf(iid))
-        changed = {k for k in ("SIZE", "MODE", "POS", "OPACITY")
+        changed = {k for k in ("SIZE", "MODE", "POS", "OPACITY", "FPS")
                    if cfg.get(k, "") != disk.get(k, "")}
         write_config(cfg, inst_conf(iid))
         if changed:
@@ -816,6 +966,11 @@ def main():
         if not changed and is_running_inst(iid):
             refresh_status_line()
             set_status(f"Sin cambios (sigue igual @ {cfg['POS'] or 'nativo'})")
+            return
+        # Solo velocidad: IPC en vivo, sin relanzar (conserva el sitio).
+        if changed == {"FPS"} and is_running_inst(iid):
+            set_status("Aplicando velocidad en vivo...")
+            in_thread(_fps_live_done, _fps_live, iid, int(cfg["FPS"]))
             return
         # Solo opacidad: regla en vivo, sin relanzar (conserva el sitio).
         if changed == {"OPACITY"} and is_running_inst(iid):
@@ -873,16 +1028,8 @@ def main():
                      else "Posicion: libre (se puede mover)")
         lock_btn.config(text="Desbloquear posicion" if locked else "Bloquear posicion")
 
-    def running_ids():
-        """Ids con ventana mostrandose (parsea gifdesk --list)."""
-        rc, out = run_gifdesk("--list")
-        ids = []
-        if rc == 0:
-            for line in out.splitlines():
-                parts = line.split()
-                if len(parts) >= 2 and parts[1] == "corriendo":
-                    ids.append(parts[0])
-        return ids
+    # running_ids() ya es de nivel de modulo (una sola llamada): la galeria
+    # lo usa y do_lock_toggle lo reutiliza.
 
     def apply_live_geometry(iid):
         """Lee X Y W H reales (kdotool) y los guarda en la config + bump.
